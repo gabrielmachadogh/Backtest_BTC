@@ -29,44 +29,57 @@ class BTCBacktest:
         self.exit_first_profit = exit_first_profit
         self.exit_on_ma_turn = exit_on_ma_turn
     
-    def download_from_yfinance_1h(self):
-        """Download direto yfinance 1h → 4h (MAIS CONFIÁVEL)"""
-        print(f"Baixando yfinance (1h → 4h)...")
+    def download_from_coingecko(self):
+        """Download Coingecko API (GRÁTIS, SEM API KEY)"""
+        print(f"Baixando Coingecko API (dados desde 2020)...")
         
         try:
-            import yfinance as yf
+            # Desde 2020 até agora
+            start_timestamp = int(datetime(2020, 1, 1).timestamp())
+            end_timestamp = int(datetime.now().timestamp())
             
-            # Desde 2020 até AGORA (não futuro!)
-            start_date = datetime(2020, 1, 1)
-            end_date = datetime.now()
+            # API Coingecko (sem API key necessária)
+            url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range"
+            params = {
+                'vs_currency': 'usd',
+                'from': start_timestamp,
+                'to': end_timestamp
+            }
             
-            print(f"  Período: {start_date.date()} até {end_date.date()}")
+            print(f"  Buscando dados de {datetime.fromtimestamp(start_timestamp)} até {datetime.fromtimestamp(end_timestamp)}...")
             
-            ticker = yf.Ticker("BTC-USD")
-            df = ticker.history(start=start_date, end=end_date, interval='1h')
+            response = requests.get(url, params=params, timeout=60)
+            response.raise_for_status()
+            data = response.json()
             
-            if df.empty:
+            if 'prices' not in data:
                 return None
             
-            print(f"  Baixados {len(df)} candles de 1h")
+            # Converter para DataFrame
+            prices = data['prices']
+            df = pd.DataFrame(prices, columns=['timestamp', 'close'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
             
-            # Garantir colunas corretas
-            if 'Close' not in df.columns and 'close' in df.columns:
-                df = df.rename(columns={
-                    'close': 'Close',
-                    'open': 'Open',
-                    'high': 'High',
-                    'low': 'Low',
-                    'volume': 'Volume'
-                })
+            # Coingecko retorna dados de 1h quando período > 90 dias
+            print(f"  Recebidos {len(df)} pontos de dados")
             
-            # Filtrar apenas passado
-            now = pd.Timestamp.now()
-            df = df[df.index <= now]
+            # Criar OHLC a partir dos dados de close (aproximação)
+            # Resample para 1H primeiro
+            df_1h = df.resample('1H').agg({
+                'close': 'last'
+            }).fillna(method='ffill')
             
-            # Agregar para 4h
+            # Criar OHLC artificial (baseado em close)
+            df_1h['Open'] = df_1h['close']
+            df_1h['High'] = df_1h['close'] * 1.001  # Aproximação
+            df_1h['Low'] = df_1h['close'] * 0.999   # Aproximação
+            df_1h['Close'] = df_1h['close']
+            df_1h['Volume'] = 1  # Placeholder
+            
+            # Agregar para 4H
             print(f"  Agregando para 4H...")
-            df = df.resample('4H').agg({
+            df_4h = df_1h.resample('4H').agg({
                 'Open': 'first',
                 'High': 'max',
                 'Low': 'min',
@@ -74,22 +87,13 @@ class BTCBacktest:
                 'Volume': 'sum'
             }).dropna()
             
-            # Filtrar desde 2020
-            min_date = pd.Timestamp('2020-01-01')
-            df = df[df.index >= min_date]
+            print(f"  Resultado: {len(df_4h)} candles de 4H")
+            print(f"  Período: {df_4h.index[0]} até {df_4h.index[-1]}")
             
-            # Filtrar futuro (segurança extra)
-            df = df[df.index <= now]
-            
-            print(f"  Resultado: {len(df)} candles de 4H")
-            print(f"  Período final: {df.index[0]} até {df.index[-1]}")
-            
-            df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-            
-            return df
+            return df_4h[['Open', 'High', 'Low', 'Close', 'Volume']]
             
         except Exception as e:
-            print(f"  yfinance falhou: {str(e)}")
+            print(f"  Coingecko falhou: {str(e)}")
             return None
     
     def download_data(self, years=5):
@@ -98,9 +102,9 @@ class BTCBacktest:
         
         print(f"Baixando dados 4H desde 2020...")
         
-        # YFinance é mais confiável para dados recentes
+        # Coingecko (mais confiável para histórico)
         try:
-            df = self.download_from_yfinance_1h()
+            df = self.download_from_coingecko()
             if df is not None and len(df) > 100:
                 return df
         except Exception as e:
@@ -407,13 +411,12 @@ def massive_4h_optimization(df_data_4h):
     print(f"\n🏆 MELHOR: Body {best['body_pct']:.0f}%, Size {best['candle_size_mult']:.1f}x")
     print(f"   Retorno: {best['total_return']:.2f}%, WR: {best['win_rate']:.1f}%")
     
-    # CORREÇÃO: Retornar dict, não Series
     return best.to_dict()
 
 
 def main():
     print("="*70)
-    print("🚀 BACKTEST 4H (2020-2024) 🚀")
+    print("🚀 BACKTEST 4H (2020-2024) - COINGECKO API 🚀")
     print("="*70)
     
     bt_temp = BTCBacktest(timeframe='4h', ma_period=8, initial_capital=10000)
@@ -427,7 +430,6 @@ def main():
     
     best_4h = massive_4h_optimization(df_4h)
     
-    # CORREÇÃO: Verificar se é None
     if best_4h is not None:
         print("\n🏆 Rodando backtest final...")
         bt = BTCBacktest(
