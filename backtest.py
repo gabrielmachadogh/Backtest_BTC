@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
+import time
 
 class BTCBacktest:
     def __init__(self, timeframe='1d', ma_period=8, initial_capital=10000):
@@ -17,20 +18,78 @@ class BTCBacktest:
         self.trades = []
         self.equity_curve = []
         
-    def download_data(self, years=15):
-        """Baixa dados históricos do BTC"""
+    def download_data(self, years=15, max_retries=3):
+        """Baixa dados históricos do BTC com retry"""
         print(f"Baixando dados BTC ({self.timeframe}) dos últimos {years} anos...")
         
         end_date = datetime.now()
         start_date = end_date - timedelta(days=years*365)
         
-        ticker = "BTC-USD"
-        df = yf.download(ticker, start=start_date, end=end_date, interval=self.timeframe, progress=False)
+        # Lista de tickers alternativos
+        tickers = ["BTC-USD", "BTCUSD=X"]
         
-        if df.empty:
-            raise Exception("Erro ao baixar dados")
+        df = None
+        for ticker in tickers:
+            for attempt in range(max_retries):
+                try:
+                    print(f"Tentativa {attempt + 1}/{max_retries} para {ticker}...")
+                    
+                    # Download com configurações específicas
+                    data = yf.download(
+                        ticker, 
+                        start=start_date, 
+                        end=end_date, 
+                        interval=self.timeframe,
+                        progress=False,
+                        auto_adjust=True,
+                        prepost=False,
+                        threads=True,
+                        proxy=None
+                    )
+                    
+                    if not data.empty and len(data) > 100:
+                        df = data
+                        print(f"✓ Dados baixados com sucesso usando {ticker}")
+                        print(f"  {len(df)} candles de {df.index[0]} até {df.index[-1]}")
+                        break
+                    else:
+                        print(f"  Dados insuficientes ou vazios")
+                        
+                except Exception as e:
+                    print(f"  Erro: {str(e)}")
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2
+                        print(f"  Aguardando {wait_time}s antes de tentar novamente...")
+                        time.sleep(wait_time)
+            
+            if df is not None and not df.empty:
+                break
         
-        print(f"Dados baixados: {len(df)} candles de {df.index[0]} até {df.index[-1]}")
+        if df is None or df.empty:
+            raise Exception("Não foi possível baixar dados após todas as tentativas")
+        
+        # Renomear colunas se necessário
+        df.columns = df.columns.str.strip()
+        column_mapping = {
+            'Open': 'Open',
+            'High': 'High', 
+            'Low': 'Low',
+            'Close': 'Close',
+            'Volume': 'Volume'
+        }
+        
+        # Se as colunas já estão corretas
+        if 'Close' in df.columns:
+            return df
+        
+        # Se vieram em minúsculas ou com o ticker
+        for col in df.columns:
+            col_clean = col.split()[0] if ' ' in col else col
+            for std_name in column_mapping.keys():
+                if std_name.lower() in col.lower():
+                    df.rename(columns={col: std_name}, inplace=True)
+                    break
+        
         return df
     
     def calculate_ma(self, df):
@@ -67,7 +126,7 @@ class BTCBacktest:
                 if df.loc[df.index[i-1], 'MA_Turn_Up']:
                     entry_trigger = df.loc[df.index[i-1], 'High']
                     stop_loss = df.loc[df.index[i-1], 'Low']
-                    print(f"\n[{current_idx}] MA virou para CIMA - Gatilho de entrada: ${entry_trigger:.2f}, Stop: ${stop_loss:.2f}")
+                    print(f"\n[{current_idx.strftime('%Y-%m-%d')}] MA virou para CIMA - Gatilho: ${entry_trigger:.2f}, Stop: ${stop_loss:.2f}")
                 
                 # Tenta entrar se romper o gatilho
                 if entry_trigger and current_price >= entry_trigger:
@@ -78,7 +137,7 @@ class BTCBacktest:
                         'quantity': quantity,
                         'stop_loss': stop_loss
                     }
-                    print(f"[{current_idx}] ENTRADA em ${entry_trigger:.2f} | Stop: ${stop_loss:.2f} | Quantidade: {quantity:.6f} BTC")
+                    print(f"[{current_idx.strftime('%Y-%m-%d')}] ENTRADA ${entry_trigger:.2f} | Qtd: {quantity:.6f} BTC")
                     entry_trigger = None
                     
             # Verifica se está em posição
@@ -93,11 +152,11 @@ class BTCBacktest:
                 # Detecta virada da MA para baixo
                 if df.loc[df.index[i-1], 'MA_Turn_Down']:
                     exit_trigger = df.loc[df.index[i-1], 'Low']
-                    print(f"\n[{current_idx}] MA virou para BAIXO - Gatilho de saída: ${exit_trigger:.2f}")
+                    print(f"\n[{current_idx.strftime('%Y-%m-%d')}] MA virou para BAIXO - Gatilho saída: ${exit_trigger:.2f}")
                 
                 # Desarma saída se MA virar para cima novamente
                 if df.loc[df.index[i-1], 'MA_Turn_Up'] and exit_trigger:
-                    print(f"[{current_idx}] MA virou para CIMA novamente - DESARMANDO saída")
+                    print(f"[{current_idx.strftime('%Y-%m-%d')}] MA virou CIMA - DESARMANDO saída")
                     exit_trigger = None
                 
                 # Tenta sair se atingir o gatilho
@@ -143,14 +202,14 @@ class BTCBacktest:
         }
         
         self.trades.append(trade)
-        print(f"[{exit_date}] SAÍDA em ${exit_price:.2f} | Motivo: {reason} | PnL: ${pnl:.2f} ({pnl_pct:.2f}%) | Capital: ${self.capital:.2f}")
+        print(f"[{exit_date.strftime('%Y-%m-%d')}] SAÍDA ${exit_price:.2f} | {reason} | PnL: ${pnl:.2f} ({pnl_pct:.2f}%)")
         
         self.position = None
     
     def calculate_metrics(self):
         """Calcula métricas de performance"""
         if not self.trades:
-            return {}
+            return {}, pd.DataFrame(), pd.DataFrame(self.equity_curve)
         
         df_trades = pd.DataFrame(self.trades)
         df_equity = pd.DataFrame(self.equity_curve)
@@ -203,9 +262,10 @@ class BTCBacktest:
         print(f"Profit Factor: {metrics['profit_factor']:.2f}")
         print("="*60)
     
-    def plot_results(self, df, df_equity, df_trades):
+    def plot_results(self, df, df_equity, df_trades, timeframe_name):
         """Gera gráficos dos resultados"""
-        os.makedirs('results', exist_ok=True)
+        output_dir = f'results/{timeframe_name}'
+        os.makedirs(output_dir, exist_ok=True)
         
         # Gráfico 1: Preço e MA com sinais
         fig = make_subplots(rows=2, cols=1, 
@@ -230,23 +290,24 @@ class BTCBacktest:
                                 line=dict(color='orange', width=2)),
                      row=1, col=1)
         
-        # Sinais de entrada
-        entries = df_trades[['entry_date', 'entry_price']].copy()
-        fig.add_trace(go.Scatter(x=entries['entry_date'],
-                                y=entries['entry_price'],
-                                mode='markers',
-                                name='Entrada',
-                                marker=dict(color='green', size=10, symbol='triangle-up')),
-                     row=1, col=1)
-        
-        # Sinais de saída
-        exits = df_trades[['exit_date', 'exit_price']].copy()
-        fig.add_trace(go.Scatter(x=exits['exit_date'],
-                                y=exits['exit_price'],
-                                mode='markers',
-                                name='Saída',
-                                marker=dict(color='red', size=10, symbol='triangle-down')),
-                     row=1, col=1)
+        if not df_trades.empty:
+            # Sinais de entrada
+            entries = df_trades[['entry_date', 'entry_price']].copy()
+            fig.add_trace(go.Scatter(x=entries['entry_date'],
+                                    y=entries['entry_price'],
+                                    mode='markers',
+                                    name='Entrada',
+                                    marker=dict(color='green', size=10, symbol='triangle-up')),
+                         row=1, col=1)
+            
+            # Sinais de saída
+            exits = df_trades[['exit_date', 'exit_price']].copy()
+            fig.add_trace(go.Scatter(x=exits['exit_date'],
+                                    y=exits['exit_price'],
+                                    mode='markers',
+                                    name='Saída',
+                                    marker=dict(color='red', size=10, symbol='triangle-down')),
+                         row=1, col=1)
         
         # Equity Curve
         fig.add_trace(go.Scatter(x=df_equity['date'],
@@ -265,8 +326,12 @@ class BTCBacktest:
             xaxis_rangeslider_visible=False
         )
         
-        fig.write_html('results/backtest_chart.html')
-        print("\nGráfico salvo em: results/backtest_chart.html")
+        fig.write_html(f'{output_dir}/backtest_chart.html')
+        print(f"\nGráfico salvo em: {output_dir}/backtest_chart.html")
+        
+        if df_trades.empty:
+            print("Nenhum trade executado - pulando gráficos de métricas")
+            return
         
         # Gráfico 2: Distribuição de trades
         fig2, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
@@ -302,13 +367,16 @@ class BTCBacktest:
         ax4.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig('results/metrics.png', dpi=300, bbox_inches='tight')
-        print("Gráfico de métricas salvo em: results/metrics.png")
+        plt.savefig(f'{output_dir}/metrics.png', dpi=300, bbox_inches='tight')
+        print(f"Gráfico de métricas salvo em: {output_dir}/metrics.png")
+        plt.close()
         
-    def save_trades_csv(self, df_trades):
+    def save_trades_csv(self, df_trades, timeframe_name):
         """Salva trades em CSV"""
-        df_trades.to_csv('results/trades.csv', index=False)
-        print("Trades salvos em: results/trades.csv")
+        output_dir = f'results/{timeframe_name}'
+        os.makedirs(output_dir, exist_ok=True)
+        df_trades.to_csv(f'{output_dir}/trades.csv', index=False)
+        print(f"Trades salvos em: {output_dir}/trades.csv")
 
 
 def main():
@@ -324,8 +392,8 @@ def main():
     bt_d1.run_backtest(df_d1)
     metrics_d1, trades_d1, equity_d1 = bt_d1.calculate_metrics()
     bt_d1.print_results(metrics_d1)
-    bt_d1.plot_results(df_d1, equity_d1, trades_d1)
-    bt_d1.save_trades_csv(trades_d1)
+    bt_d1.plot_results(df_d1, equity_d1, trades_d1, 'daily')
+    bt_d1.save_trades_csv(trades_d1, 'daily')
     
     # Backtest W1 (semanal)
     print("\n\n### TIMEFRAME SEMANAL (W1) ###")
@@ -335,35 +403,8 @@ def main():
     bt_w1.run_backtest(df_w1)
     metrics_w1, trades_w1, equity_w1 = bt_w1.calculate_metrics()
     bt_w1.print_results(metrics_w1)
-    
-    # Salvar resultados W1 separadamente
-    os.makedirs('results/weekly', exist_ok=True)
-    
-    # Renomear arquivos D1
-    os.rename('results/backtest_chart.html', 'results/daily/backtest_chart_D1.html')
-    os.rename('results/metrics.png', 'results/daily/metrics_D1.png')
-    os.rename('results/trades.csv', 'results/daily/trades_D1.csv')
-    
-    # Criar diretório daily
-    os.makedirs('results/daily', exist_ok=True)
-    
-    # Mover arquivos D1
-    import shutil
-    if os.path.exists('results/backtest_chart.html'):
-        shutil.move('results/backtest_chart.html', 'results/daily/backtest_chart_D1.html')
-    if os.path.exists('results/metrics.png'):
-        shutil.move('results/metrics.png', 'results/daily/metrics_D1.png')
-    if os.path.exists('results/trades.csv'):
-        shutil.move('results/trades.csv', 'results/daily/trades_D1.csv')
-    
-    # Gerar gráficos W1
-    bt_w1.plot_results(df_w1, equity_w1, trades_w1)
-    bt_w1.save_trades_csv(trades_w1)
-    
-    # Mover arquivos W1
-    shutil.move('results/backtest_chart.html', 'results/weekly/backtest_chart_W1.html')
-    shutil.move('results/metrics.png', 'results/weekly/metrics_W1.png')
-    shutil.move('results/trades.csv', 'results/weekly/trades_W1.csv')
+    bt_w1.plot_results(df_w1, equity_w1, trades_w1, 'weekly')
+    bt_w1.save_trades_csv(trades_w1, 'weekly')
     
     print("\n" + "="*60)
     print("BACKTEST CONCLUÍDO COM SUCESSO!")
@@ -375,3 +416,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
