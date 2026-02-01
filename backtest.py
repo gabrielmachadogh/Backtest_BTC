@@ -12,7 +12,7 @@ from itertools import product
 class BTCBacktest:
     def __init__(self, timeframe='1d', ma_period=8, initial_capital=10000, 
                  body_pct_min=0, close_position_min=0, candle_size_multiplier=0,
-                 take_profit_multiplier=0):
+                 take_profit_multiplier=0, exit_first_profit=False):
         self.timeframe = timeframe
         self.ma_period = ma_period
         self.initial_capital = initial_capital
@@ -21,11 +21,14 @@ class BTCBacktest:
         self.trades = []
         self.equity_curve = []
         
-        # Filtros adicionais
+        # Filtros de entrada
         self.body_pct_min = body_pct_min
         self.close_position_min = close_position_min
         self.candle_size_multiplier = candle_size_multiplier
-        self.take_profit_multiplier = take_profit_multiplier  # NOVO: alvo fixo
+        
+        # Estratégias de saída
+        self.take_profit_multiplier = take_profit_multiplier
+        self.exit_first_profit = exit_first_profit  # NOVO: sair no primeiro candle com lucro
         
     def download_from_cryptocompare(self, days):
         """Baixa dados do CryptoCompare API"""
@@ -275,6 +278,7 @@ class BTCBacktest:
             current_idx = df.index[i]
             current_price = df.loc[current_idx, 'High']
             current_low = df.loc[current_idx, 'Low']
+            current_close = df.loc[current_idx, 'Close']
             
             if self.position is None:
                 if df.loc[df.index[i-1], 'MA_Turn_Up']:
@@ -302,12 +306,21 @@ class BTCBacktest:
                     entry_trigger = None
                     
             else:
-                # Verifica take profit primeiro
-                if self.position['take_profit'] and current_price >= self.position['take_profit']:
-                    exit_price = self.position['take_profit']
-                    self.close_position(current_idx, exit_price, 'Take Profit')
-                    exit_trigger = None
-                    continue
+                # NOVO: Saída no primeiro candle com lucro (no fechamento)
+                if self.exit_first_profit:
+                    if current_close > self.position['entry_price']:
+                        exit_price = current_close
+                        self.close_position(current_idx, exit_price, 'First Profit Close')
+                        exit_trigger = None
+                        continue
+                
+                # Verifica take profit (se não usa exit_first_profit)
+                if not self.exit_first_profit and self.position['take_profit']:
+                    if current_price >= self.position['take_profit']:
+                        exit_price = self.position['take_profit']
+                        self.close_position(current_idx, exit_price, 'Take Profit')
+                        exit_trigger = None
+                        continue
                 
                 # Verifica stop loss
                 if current_low <= self.position['stop_loss']:
@@ -316,8 +329,8 @@ class BTCBacktest:
                     exit_trigger = None
                     continue
                 
-                # Detecta virada da MA para baixo (apenas se não tem TP fixo)
-                if self.take_profit_multiplier == 0:
+                # Detecta virada da MA para baixo (apenas se não tem TP fixo nem exit_first_profit)
+                if not self.exit_first_profit and self.take_profit_multiplier == 0:
                     if df.loc[df.index[i-1], 'MA_Turn_Down']:
                         exit_trigger = df.loc[df.index[i-1], 'Low']
                     
@@ -448,9 +461,9 @@ class BTCBacktest:
             
             print("="*70)
         else:
-            print(f"Trades: {metrics['total_trades']:3d} | WinRate: {metrics['win_rate']:5.1f}% | "
-                  f"Return: {metrics['total_return']:10.2f}% | PF: {metrics['profit_factor']:5.2f} | "
-                  f"Exp: {metrics['expectancy_pct']:6.2f}% | DD: {metrics['max_drawdown']:6.2f}%")
+            print(f"T:{metrics['total_trades']:3d} | WR:{metrics['win_rate']:5.1f}% | "
+                  f"Ret:{metrics['total_return']:9.2f}% | PF:{metrics['profit_factor']:5.2f} | "
+                  f"Exp:{metrics['expectancy_pct']:6.2f}% | DD:{metrics['max_drawdown']:6.2f}%")
     
     def plot_results(self, df, df_equity, df_trades, timeframe_name):
         """Gera gráficos dos resultados"""
@@ -587,7 +600,8 @@ class BTCBacktest:
                 f.write(f"  Body % mínimo:           {filter_config['body_pct']}%\n")
                 f.write(f"  Close Position mínimo:   {filter_config['close_pos']}%\n")
                 f.write(f"  Candle Size multiplier:  {filter_config['size_mult']}x\n")
-                f.write(f"  Take Profit multiplier:  {filter_config['tp_mult']}x\n\n")
+                f.write(f"  Take Profit multiplier:  {filter_config['tp_mult']}x\n")
+                f.write(f"  Exit First Profit:       {filter_config['exit_fp']}\n\n")
             
             f.write(f"Capital Inicial:      ${metrics['initial_capital']:,.2f}\n")
             f.write(f"Capital Final:        ${metrics['final_capital']:,.2f}\n")
@@ -614,35 +628,43 @@ class BTCBacktest:
             f.write("="*70 + "\n")
 
 
-def optimize_filters(df_data):
-    """Otimiza os filtros incluindo take profit"""
+def massive_optimization(df_data):
+    """Otimização massiva para buscar Win Rate máxima"""
     print("\n" + "="*70)
-    print("OTIMIZAÇÃO COMPLETA - INCLUINDO TAKE PROFIT FIXO")
+    print("🚀 OTIMIZAÇÃO MASSIVA - BUSCA DA WIN RATE MÁXIMA 🚀")
     print("="*70)
-    print("\nTestando combinações de filtros...\n")
+    print("\nTestando TODAS as combinações possíveis...\n")
     
-    # Valores base (melhores da otimização anterior)
-    body_pct_values = [0, 45, 50]
-    close_position_values = [0]
-    candle_size_values = [1.5, 2.0]
-    
-    # NOVO: Take Profit multiplier (0 = usar MA para sair)
-    take_profit_values = [0, 1.1, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.1, 2.2]
+    # Definir valores a testar (ampliado)
+    body_pct_values = [0, 40, 45, 50, 55, 60]
+    close_position_values = [0, 50, 60, 70, 80, 90]
+    candle_size_values = [0, 1.0, 1.2, 1.5, 1.8, 2.0, 2.5, 3.0]
+    take_profit_values = [0, 1.1, 1.3, 1.5, 1.7, 1.9, 2.0, 2.2, 2.5, 3.0]
+    exit_first_profit_values = [False, True]
     
     results = []
     total_combinations = (len(body_pct_values) * len(close_position_values) * 
-                         len(candle_size_values) * len(take_profit_values))
+                         len(candle_size_values) * len(take_profit_values) *
+                         len(exit_first_profit_values))
     current = 0
     
-    print(f"Total de combinações: {total_combinations}\n")
+    print(f"📊 Total de combinações: {total_combinations}")
+    print(f"⏱️  Tempo estimado: ~{total_combinations * 0.5 / 60:.1f} minutos\n")
+    print("Progresso:")
     
-    for body_pct, close_pos, size_mult, tp_mult in product(
-        body_pct_values, close_position_values, candle_size_values, take_profit_values):
+    for body_pct, close_pos, size_mult, tp_mult, exit_fp in product(
+        body_pct_values, close_position_values, candle_size_values, 
+        take_profit_values, exit_first_profit_values):
         
         current += 1
         
-        tp_label = f"{tp_mult}x" if tp_mult > 0 else "MA"
-        print(f"[{current}/{total_combinations}] Body:{body_pct}% | Size:{size_mult}x | TP:{tp_label:4} ... ", end='')
+        # Pular combinações inválidas
+        if exit_fp and tp_mult > 0:  # Não faz sentido ter TP fixo + exit first profit
+            continue
+        
+        if current % 50 == 0:
+            progress = (current / total_combinations) * 100
+            print(f"  [{current}/{total_combinations}] {progress:.1f}% completo...")
         
         bt = BTCBacktest(
             timeframe='1d',
@@ -651,7 +673,8 @@ def optimize_filters(df_data):
             body_pct_min=body_pct,
             close_position_min=close_pos,
             candle_size_multiplier=size_mult,
-            take_profit_multiplier=tp_mult
+            take_profit_multiplier=tp_mult,
+            exit_first_profit=exit_fp
         )
         
         df_test = df_data.copy()
@@ -661,136 +684,186 @@ def optimize_filters(df_data):
         
         metrics, trades, equity = bt.calculate_metrics()
         
-        if metrics['total_trades'] >= 10:
+        if metrics['total_trades'] >= 10:  # Mínimo de 10 trades
+            exit_strategy = "FirstProfit" if exit_fp else (f"TP{tp_mult}x" if tp_mult > 0 else "MA")
+            
             results.append({
                 'body_pct': body_pct,
                 'close_position': close_pos,
                 'candle_size_mult': size_mult,
                 'take_profit_mult': tp_mult,
+                'exit_first_profit': exit_fp,
+                'exit_strategy': exit_strategy,
                 **metrics
             })
-            bt.print_results(metrics, show_full=False)
-        else:
-            print(f"Poucos trades ({metrics['total_trades']}) - Descartado")
     
     df_results = pd.DataFrame(results)
     
     if df_results.empty:
-        print("\nNenhuma combinação válida encontrada!")
+        print("\n❌ Nenhuma combinação válida encontrada!")
         return None
+    
+    print(f"\n✅ Otimização concluída! {len(df_results)} configurações válidas.\n")
     
     # Salvar resultados completos
     os.makedirs('results/optimization', exist_ok=True)
-    df_results.to_csv('results/optimization/full_optimization.csv', index=False)
+    df_results.to_csv('results/optimization/massive_optimization.csv', index=False)
     
-    # Criar múltiplas visualizações
-    print("\n" + "="*70)
-    print("TOP 10 CONFIGURAÇÕES (por Win Rate)")
-    print("="*70)
+    # === RANKING 1: Win Rate Máxima ===
+    print("\n" + "="*90)
+    print("🏆 TOP 15 - MÁXIMA WIN RATE")
+    print("="*90)
     
-    df_by_winrate = df_results.sort_values('win_rate', ascending=False)
-    print(f"{'#':<3} {'Body%':<7} {'Size':<6} {'TP':<6} {'Trades':<7} {'WinRate':<9} "
-          f"{'Exp%':<8} {'Return%':<12} {'PF':<6} {'DD%':<7}")
-    print("-"*70)
+    df_by_wr = df_results.sort_values('win_rate', ascending=False)
+    print(f"{'#':<3} {'Body%':<6} {'Close%':<7} {'Size':<5} {'Exit':<11} {'Trades':<7} "
+          f"{'WR%':<7} {'Exp%':<7} {'Ret%':<10} {'PF':<5} {'DD%':<7}")
+    print("-"*90)
     
-    for idx, row in df_by_winrate.head(10).iterrows():
-        tp_label = f"{row['take_profit_mult']:.1f}x" if row['take_profit_mult'] > 0 else "MA"
-        print(f"{df_by_winrate.index.get_loc(idx)+1:<3} "
-              f"{row['body_pct']:<7.0f} "
-              f"{row['candle_size_mult']:<6.1f} "
-              f"{tp_label:<6} "
+    for idx, row in df_by_wr.head(15).iterrows():
+        print(f"{df_by_wr.index.get_loc(idx)+1:<3} "
+              f"{row['body_pct']:<6.0f} "
+              f"{row['close_position']:<7.0f} "
+              f"{row['candle_size_mult']:<5.1f} "
+              f"{row['exit_strategy']:<11} "
               f"{row['total_trades']:<7.0f} "
-              f"{row['win_rate']:<9.1f} "
-              f"{row['expectancy_pct']:<8.2f} "
-              f"{row['total_return']:<12.2f} "
-              f"{row['profit_factor']:<6.2f} "
+              f"{row['win_rate']:<7.1f} "
+              f"{row['expectancy_pct']:<7.2f} "
+              f"{row['total_return']:<10.2f} "
+              f"{row['profit_factor']:<5.2f} "
               f"{row['max_drawdown']:<7.2f}")
     
-    print("\n" + "="*70)
-    print("TOP 10 CONFIGURAÇÕES (por Expectância %)")
-    print("="*70)
+    # === RANKING 2: Expectância ===
+    print("\n" + "="*90)
+    print("💰 TOP 15 - MÁXIMA EXPECTÂNCIA POR TRADE")
+    print("="*90)
     
     df_by_exp = df_results.sort_values('expectancy_pct', ascending=False)
-    print(f"{'#':<3} {'Body%':<7} {'Size':<6} {'TP':<6} {'Trades':<7} {'WinRate':<9} "
-          f"{'Exp%':<8} {'Return%':<12} {'PF':<6} {'DD%':<7}")
-    print("-"*70)
+    print(f"{'#':<3} {'Body%':<6} {'Close%':<7} {'Size':<5} {'Exit':<11} {'Trades':<7} "
+          f"{'WR%':<7} {'Exp%':<7} {'Ret%':<10} {'PF':<5} {'DD%':<7}")
+    print("-"*90)
     
-    for idx, row in df_by_exp.head(10).iterrows():
-        tp_label = f"{row['take_profit_mult']:.1f}x" if row['take_profit_mult'] > 0 else "MA"
+    for idx, row in df_by_exp.head(15).iterrows():
         print(f"{df_by_exp.index.get_loc(idx)+1:<3} "
-              f"{row['body_pct']:<7.0f} "
-              f"{row['candle_size_mult']:<6.1f} "
-              f"{tp_label:<6} "
+              f"{row['body_pct']:<6.0f} "
+              f"{row['close_position']:<7.0f} "
+              f"{row['candle_size_mult']:<5.1f} "
+              f"{row['exit_strategy']:<11} "
               f"{row['total_trades']:<7.0f} "
-              f"{row['win_rate']:<9.1f} "
-              f"{row['expectancy_pct']:<8.2f} "
-              f"{row['total_return']:<12.2f} "
-              f"{row['profit_factor']:<6.2f} "
+              f"{row['win_rate']:<7.1f} "
+              f"{row['expectancy_pct']:<7.2f} "
+              f"{row['total_return']:<10.2f} "
+              f"{row['profit_factor']:<5.2f} "
               f"{row['max_drawdown']:<7.2f}")
     
-    print("\n" + "="*70)
-    print("TOP 10 CONFIGURAÇÕES (por Profit Factor)")
-    print("="*70)
+    # === RANKING 3: Profit Factor ===
+    print("\n" + "="*90)
+    print("📊 TOP 15 - MÁXIMO PROFIT FACTOR")
+    print("="*90)
     
     df_by_pf = df_results.sort_values('profit_factor', ascending=False)
-    print(f"{'#':<3} {'Body%':<7} {'Size':<6} {'TP':<6} {'Trades':<7} {'WinRate':<9} "
-          f"{'Exp%':<8} {'Return%':<12} {'PF':<6} {'DD%':<7}")
-    print("-"*70)
+    print(f"{'#':<3} {'Body%':<6} {'Close%':<7} {'Size':<5} {'Exit':<11} {'Trades':<7} "
+          f"{'WR%':<7} {'Exp%':<7} {'Ret%':<10} {'PF':<5} {'DD%':<7}")
+    print("-"*90)
     
-    for idx, row in df_by_pf.head(10).iterrows():
-        tp_label = f"{row['take_profit_mult']:.1f}x" if row['take_profit_mult'] > 0 else "MA"
+    for idx, row in df_by_pf.head(15).iterrows():
         print(f"{df_by_pf.index.get_loc(idx)+1:<3} "
-              f"{row['body_pct']:<7.0f} "
-              f"{row['candle_size_mult']:<6.1f} "
-              f"{tp_label:<6} "
+              f"{row['body_pct']:<6.0f} "
+              f"{row['close_position']:<7.0f} "
+              f"{row['candle_size_mult']:<5.1f} "
+              f"{row['exit_strategy']:<11} "
               f"{row['total_trades']:<7.0f} "
-              f"{row['win_rate']:<9.1f} "
-              f"{row['expectancy_pct']:<8.2f} "
-              f"{row['total_return']:<12.2f} "
-              f"{row['profit_factor']:<6.2f} "
+              f"{row['win_rate']:<7.1f} "
+              f"{row['expectancy_pct']:<7.2f} "
+              f"{row['total_return']:<10.2f} "
+              f"{row['profit_factor']:<5.2f} "
               f"{row['max_drawdown']:<7.2f}")
     
-    # Melhor configuração (por expectância, mais confiável que win rate puro)
-    best = df_by_exp.iloc[0]
+    # === RANKING 4: Melhor Balanceado ===
+    print("\n" + "="*90)
+    print("⚖️  TOP 15 - MELHOR BALANCEADO (WR + Exp + PF)")
+    print("="*90)
+    
+    # Score composto: normaliza cada métrica e soma
+    df_results['wr_norm'] = (df_results['win_rate'] - df_results['win_rate'].min()) / (df_results['win_rate'].max() - df_results['win_rate'].min())
+    df_results['exp_norm'] = (df_results['expectancy_pct'] - df_results['expectancy_pct'].min()) / (df_results['expectancy_pct'].max() - df_results['expectancy_pct'].min())
+    df_results['pf_norm'] = (df_results['profit_factor'] - df_results['profit_factor'].min()) / (df_results['profit_factor'].max() - df_results['profit_factor'].min())
+    df_results['composite_score'] = (df_results['wr_norm'] * 0.4 + 
+                                      df_results['exp_norm'] * 0.4 + 
+                                      df_results['pf_norm'] * 0.2)
+    
+    df_balanced = df_results.sort_values('composite_score', ascending=False)
+    print(f"{'#':<3} {'Body%':<6} {'Close%':<7} {'Size':<5} {'Exit':<11} {'Trades':<7} "
+          f"{'WR%':<7} {'Exp%':<7} {'Ret%':<10} {'PF':<5} {'Score':<6}")
+    print("-"*90)
+    
+    for idx, row in df_balanced.head(15).iterrows():
+        print(f"{df_balanced.index.get_loc(idx)+1:<3} "
+              f"{row['body_pct']:<6.0f} "
+              f"{row['close_position']:<7.0f} "
+              f"{row['candle_size_mult']:<5.1f} "
+              f"{row['exit_strategy']:<11} "
+              f"{row['total_trades']:<7.0f} "
+              f"{row['win_rate']:<7.1f} "
+              f"{row['expectancy_pct']:<7.2f} "
+              f"{row['total_return']:<10.2f} "
+              f"{row['profit_factor']:<5.2f} "
+              f"{row['composite_score']:<6.3f}")
+    
+    # Melhor configuração (balanceada)
+    best = df_balanced.iloc[0]
     
     print("\n" + "="*70)
-    print("MELHOR CONFIGURAÇÃO (por Expectância)")
+    print("🎯 CONFIGURAÇÃO VENCEDORA (Melhor Balanceada)")
     print("="*70)
     print(f"Body % mínimo:          {best['body_pct']:.0f}%")
+    print(f"Close Position mínimo:  {best['close_position']:.0f}%")
     print(f"Candle Size multiplier: {best['candle_size_mult']:.1f}x")
+    print(f"Estratégia de Saída:    {best['exit_strategy']}")
     
-    if best['take_profit_mult'] > 0:
-        print(f"Take Profit:            {best['take_profit_mult']:.1f}x o risco")
-    else:
-        print(f"Take Profit:            Seguir MA (sem alvo fixo)")
-    
-    print(f"\nWin Rate:               {best['win_rate']:.2f}%")
+    print(f"\n📈 RESULTADOS:")
+    print(f"Win Rate:               {best['win_rate']:.2f}%")
     print(f"Expectância:            {best['expectancy_pct']:.2f}% por trade")
+    print(f"Profit Factor:          {best['profit_factor']:.2f}")
     print(f"Total Trades:           {best['total_trades']:.0f}")
     print(f"Retorno Total:          {best['total_return']:.2f}%")
-    print(f"Profit Factor:          {best['profit_factor']:.2f}")
     print(f"Max Drawdown:           {best['max_drawdown']:.2f}%")
+    print(f"Score Composto:         {best['composite_score']:.3f}")
     print("="*70)
+    
+    # Análise por estratégia de saída
+    print("\n" + "="*70)
+    print("📊 ANÁLISE POR ESTRATÉGIA DE SAÍDA (Médias)")
+    print("="*70)
+    
+    exit_analysis = df_results.groupby('exit_strategy').agg({
+        'win_rate': 'mean',
+        'expectancy_pct': 'mean',
+        'profit_factor': 'mean',
+        'total_trades': 'mean',
+        'total_return': 'mean'
+    }).sort_values('win_rate', ascending=False)
+    
+    print(exit_analysis.to_string())
     
     return best
 
 
 def main():
     print("="*70)
-    print("BACKTEST BTC - OTIMIZAÇÃO COMPLETA COM TAKE PROFIT")
+    print("🚀 BACKTEST BTC - OTIMIZAÇÃO MASSIVA 🚀")
     print("="*70)
     
-    print("\nBaixando dados para otimização...")
+    print("\nBaixando dados...")
     bt_temp = BTCBacktest(timeframe='1d', ma_period=8, initial_capital=10000)
     df_daily = bt_temp.download_data(years=15)
-    print(f"✓ Dados baixados: {len(df_daily)} candles")
+    print(f"✅ Dados baixados: {len(df_daily)} candles\n")
     
-    # Otimizar filtros
-    best_config = optimize_filters(df_daily)
+    # Otimização massiva
+    best_config = massive_optimization(df_daily)
     
     if best_config is not None:
         print("\n" + "="*70)
-        print("EXECUTANDO BACKTEST COM MELHOR CONFIGURAÇÃO")
+        print("🏆 EXECUTANDO BACKTEST COM CONFIGURAÇÃO VENCEDORA")
         print("="*70)
         
         bt_best = BTCBacktest(
@@ -800,7 +873,8 @@ def main():
             body_pct_min=best_config['body_pct'],
             close_position_min=best_config['close_position'],
             candle_size_multiplier=best_config['candle_size_mult'],
-            take_profit_multiplier=best_config['take_profit_mult']
+            take_profit_multiplier=best_config['take_profit_mult'],
+            exit_first_profit=best_config['exit_first_profit']
         )
         
         df_daily_best = df_daily.copy()
@@ -816,12 +890,13 @@ def main():
             'body_pct': best_config['body_pct'],
             'close_pos': best_config['close_position'],
             'size_mult': best_config['candle_size_mult'],
-            'tp_mult': best_config['take_profit_mult']
+            'tp_mult': best_config['take_profit_mult'],
+            'exit_fp': best_config['exit_first_profit']
         })
     
     # Backtest semanal
     print("\n\n" + "="*70)
-    print("TIMEFRAME SEMANAL (W1) - SEM FILTROS")
+    print("📅 TIMEFRAME SEMANAL (W1)")
     print("="*70)
     
     bt_w1 = BTCBacktest(timeframe='1wk', ma_period=8, initial_capital=10000)
@@ -835,12 +910,12 @@ def main():
     bt_w1.save_summary(metrics_w1, 'weekly')
     
     print("\n" + "="*70)
-    print("✓ BACKTEST CONCLUÍDO COM SUCESSO!")
+    print("✅ BACKTEST CONCLUÍDO!")
     print("="*70)
-    print("\nResultados salvos em:")
-    print("- results/daily_optimized/  (timeframe diário otimizado)")
-    print("- results/weekly/           (timeframe semanal)")
-    print("- results/optimization/     (análise completa de otimização)")
+    print("\n📁 Resultados salvos em:")
+    print("  • results/daily_optimized/")
+    print("  • results/weekly/")
+    print("  • results/optimization/massive_optimization.csv")
 
 
 if __name__ == "__main__":
