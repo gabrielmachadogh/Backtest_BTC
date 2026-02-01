@@ -29,166 +29,19 @@ class BTCBacktest:
         self.exit_first_profit = exit_first_profit
         self.exit_on_ma_turn = exit_on_ma_turn
     
-    def download_from_cryptocompare(self, days):
-        """Baixa dados do CryptoCompare API (CORRIGIDO v2)"""
-        print(f"Baixando dados do CryptoCompare...")
-        
-        if self.timeframe in ['4h', '4H']:
-            endpoint = 'https://min-api.cryptocompare.com/data/v2/histohour'
-            hours_needed = days * 24
-            limit_per_request = 2000
-        elif self.timeframe in ['1d', '1D']:
-            endpoint = 'https://min-api.cryptocompare.com/data/v2/histoday'
-            limit_per_request = 2000
-        elif self.timeframe in ['1wk', '1W']:
-            endpoint = 'https://min-api.cryptocompare.com/data/v2/histoday'
-            limit_per_request = 2000
-        else:
-            endpoint = 'https://min-api.cryptocompare.com/data/v2/histoday'
-            limit_per_request = 2000
-        
-        all_data = []
-        to_timestamp = int(time.time())
-        
-        if self.timeframe in ['4h', '4H']:
-            total_hours = days * 24
-            iterations = (total_hours // limit_per_request) + 1
-            
-            print(f"  Buscando {total_hours} horas em {iterations} requests...")
-            
-            for i in range(iterations):
-                params = {
-                    'fsym': 'BTC',
-                    'tsym': 'USD',
-                    'limit': limit_per_request,
-                    'toTs': to_timestamp
-                }
-                
-                try:
-                    response = requests.get(endpoint, params=params, timeout=30)
-                    response.raise_for_status()
-                    data = response.json()
-                    
-                    if data['Response'] == 'Success':
-                        df_chunk = pd.DataFrame(data['Data']['Data'])
-                        
-                        if not df_chunk.empty:
-                            all_data.append(df_chunk)
-                            to_timestamp = int(df_chunk['time'].min()) - 3600
-                            
-                            if len(df_chunk) < limit_per_request:
-                                break
-                        else:
-                            break
-                    else:
-                        print(f"  Erro na API: {data.get('Message', 'Unknown')}")
-                        break
-                    
-                    time.sleep(0.3)
-                        
-                except Exception as e:
-                    print(f"  Erro ao baixar chunk {i}: {str(e)}")
-                    break
-        else:
-            iterations = (days // limit_per_request) + 1
-            
-            for i in range(iterations):
-                params = {
-                    'fsym': 'BTC',
-                    'tsym': 'USD',
-                    'limit': min(limit_per_request, days - len(all_data) * limit_per_request),
-                    'toTs': to_timestamp
-                }
-                
-                try:
-                    response = requests.get(endpoint, params=params, timeout=30)
-                    response.raise_for_status()
-                    data = response.json()
-                    
-                    if data['Response'] == 'Success':
-                        df_chunk = pd.DataFrame(data['Data']['Data'])
-                        
-                        if not df_chunk.empty:
-                            all_data.append(df_chunk)
-                            to_timestamp = int(df_chunk['time'].min()) - 86400
-                            
-                            if len(df_chunk) < limit_per_request:
-                                break
-                        else:
-                            break
-                    else:
-                        break
-                    
-                    time.sleep(0.3)
-                        
-                except Exception as e:
-                    print(f"  Erro ao baixar chunk {i}: {str(e)}")
-                    break
-        
-        if not all_data:
-            return None
-        
-        df = pd.concat(all_data, ignore_index=True)
-        df = df.sort_values('time')
-        df = df.drop_duplicates(subset=['time'])
-        
-        df['Date'] = pd.to_datetime(df['time'], unit='s')
-        df.set_index('Date', inplace=True)
-        
-        df = df.rename(columns={
-            'open': 'Open',
-            'high': 'High',
-            'low': 'Low',
-            'close': 'Close',
-            'volumefrom': 'Volume'
-        })
-        
-        df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-        
-        # Agregar para 4H se necessário
-        if self.timeframe in ['4h', '4H']:
-            print(f"  Agregando {len(df)} horas para 4H...")
-            df = df.resample('4H').agg({
-                'Open': 'first',
-                'High': 'max',
-                'Low': 'min',
-                'Close': 'last',
-                'Volume': 'sum'
-            }).dropna()
-        
-        # Agregar para semanal
-        if self.timeframe in ['1wk', '1W']:
-            df = df.resample('W').agg({
-                'Open': 'first',
-                'High': 'max',
-                'Low': 'min',
-                'Close': 'last',
-                'Volume': 'sum'
-            }).dropna()
-        
-        # CORREÇÃO: Filtrar sem timezone
-        now = pd.Timestamp.now()
-        df.index = df.index.tz_localize(None)  # Remove timezone
-        df = df[df.index <= now]
-        
-        min_date = pd.Timestamp('2020-01-01')
-        df = df[df.index >= min_date]
-        
-        return df
-    
-    def download_from_yfinance_direct(self, days):
-        """Download direto do yfinance com 1h e agregação para 4h"""
-        print(f"Tentando yfinance (1h → 4h)...")
+    def download_from_yfinance_1h(self):
+        """Download direto yfinance 1h → 4h (MAIS CONFIÁVEL)"""
+        print(f"Baixando yfinance (1h → 4h)...")
         
         try:
             import yfinance as yf
             
+            # Desde 2020 até AGORA (não futuro!)
+            start_date = datetime(2020, 1, 1)
             end_date = datetime.now()
-            start_date = datetime(2020, 1, 1)  # Desde 2020
             
-            print(f"  Baixando dados de 1h desde {start_date}...")
+            print(f"  Período: {start_date.date()} até {end_date.date()}")
             
-            # Baixar dados de 1 hora
             ticker = yf.Ticker("BTC-USD")
             df = ticker.history(start=start_date, end=end_date, interval='1h')
             
@@ -197,8 +50,8 @@ class BTCBacktest:
             
             print(f"  Baixados {len(df)} candles de 1h")
             
-            # Renomear colunas se necessário
-            if 'Close' not in df.columns:
+            # Garantir colunas corretas
+            if 'Close' not in df.columns and 'close' in df.columns:
                 df = df.rename(columns={
                     'close': 'Close',
                     'open': 'Open',
@@ -206,6 +59,10 @@ class BTCBacktest:
                     'low': 'Low',
                     'volume': 'Volume'
                 })
+            
+            # Filtrar apenas passado
+            now = pd.Timestamp.now()
+            df = df[df.index <= now]
             
             # Agregar para 4h
             print(f"  Agregando para 4H...")
@@ -217,9 +74,16 @@ class BTCBacktest:
                 'Volume': 'sum'
             }).dropna()
             
-            print(f"  Resultado: {len(df)} candles de 4H")
+            # Filtrar desde 2020
+            min_date = pd.Timestamp('2020-01-01')
+            df = df[df.index >= min_date]
             
-            # Garantir colunas corretas
+            # Filtrar futuro (segurança extra)
+            df = df[df.index <= now]
+            
+            print(f"  Resultado: {len(df)} candles de 4H")
+            print(f"  Período final: {df.index[0]} até {df.index[-1]}")
+            
             df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
             
             return df
@@ -229,78 +93,26 @@ class BTCBacktest:
             return None
     
     def download_data(self, years=5):
-        """Baixa dados históricos do BTC"""
-        days = years * 365
+        """Baixa dados históricos"""
         df = None
         
-        print(f"Tentando baixar {years} anos de dados (desde 2020)...")
+        print(f"Baixando dados 4H desde 2020...")
         
-        # 1. CryptoCompare
+        # YFinance é mais confiável para dados recentes
         try:
-            df = self.download_from_cryptocompare(days)
+            df = self.download_from_yfinance_1h()
             if df is not None and len(df) > 100:
-                print(f"✅ CryptoCompare: {len(df)} candles de {df.index[0]} até {df.index[-1]}")
                 return df
         except Exception as e:
-            print(f"  CryptoCompare falhou: {str(e)}")
-        
-        # 2. YFinance direto (1h → 4h)
-        if self.timeframe in ['4h', '4H']:
-            try:
-                df = self.download_from_yfinance_direct(days)
-                if df is not None and len(df) > 100:
-                    print(f"✅ YFinance: {len(df)} candles de {df.index[0]} até {df.index[-1]}")
-                    return df
-            except Exception as e:
-                print(f"  YFinance falhou: {str(e)}")
-        
-        # 3. Yahoo Finance (apenas D1/W1)
-        if self.timeframe in ['1d', '1D', '1wk', '1W']:
-            try:
-                import yfinance as yf
-                
-                end_date = datetime.now()
-                start_date = datetime(2020, 1, 1)
-                
-                interval_map = {
-                    '1d': '1d',
-                    '1D': '1d',
-                    '1wk': '1wk',
-                    '1W': '1wk'
-                }
-                
-                interval = interval_map.get(self.timeframe, '1d')
-                
-                for ticker in ["BTC-USD", "BTCUSD=X"]:
-                    try:
-                        data = yf.download(
-                            ticker,
-                            start=start_date,
-                            end=end_date,
-                            interval=interval,
-                            progress=False,
-                            auto_adjust=True
-                        )
-                        
-                        if not data.empty and len(data) > 100:
-                            df = data
-                            print(f"✅ Yahoo Finance: {len(df)} candles")
-                            break
-                    except:
-                        continue
-            except Exception as e:
-                print(f"  yfinance falhou: {str(e)}")
+            print(f"  Erro: {str(e)}")
         
         if df is None or df.empty:
-            raise Exception("Não foi possível baixar dados de nenhuma fonte")
-        
-        if len(df) < 100:
-            raise Exception(f"Dados insuficientes: apenas {len(df)} candles")
+            raise Exception("Não foi possível baixar dados")
         
         return df
     
     def calculate_candle_metrics(self, df):
-        """Calcula métricas dos candles"""
+        """Calcula métricas"""
         df['Candle_Range'] = df['High'] - df['Low']
         df['Body_Size'] = abs(df['Close'] - df['Open'])
         df['Body_Pct'] = (df['Body_Size'] / df['Candle_Range'] * 100).fillna(0)
@@ -311,7 +123,7 @@ class BTCBacktest:
         return df
     
     def calculate_ma(self, df):
-        """Calcula média móvel"""
+        """Calcula MA"""
         df['MA8'] = df['Close'].rolling(window=self.ma_period).mean()
         
         df['MA_Direction'] = 0
@@ -546,11 +358,10 @@ class BTCBacktest:
 
 
 def massive_4h_optimization(df_data_4h):
-    """Otimização rápida (versão reduzida para testar)"""
+    """Otimização"""
     print("\n🚀 OTIMIZAÇÃO 4H 🚀")
     print(f"Dados: {len(df_data_4h)} candles ({df_data_4h.index[0]} - {df_data_4h.index[-1]})\n")
     
-    # Grid reduzido para teste
     body_pct_values = [0, 30, 50]
     candle_size_values = [0, 1.0, 1.5, 2.0]
     exit_first_profit_values = [True]
@@ -587,7 +398,7 @@ def massive_4h_optimization(df_data_4h):
             bt.print_results(metrics, show_full=False)
     
     if not results:
-        print("Nenhum resultado válido")
+        print("Nenhum resultado")
         return None
     
     df_results = pd.DataFrame(results)
@@ -596,7 +407,8 @@ def massive_4h_optimization(df_data_4h):
     print(f"\n🏆 MELHOR: Body {best['body_pct']:.0f}%, Size {best['candle_size_mult']:.1f}x")
     print(f"   Retorno: {best['total_return']:.2f}%, WR: {best['win_rate']:.1f}%")
     
-    return best
+    # CORREÇÃO: Retornar dict, não Series
+    return best.to_dict()
 
 
 def main():
@@ -615,7 +427,8 @@ def main():
     
     best_4h = massive_4h_optimization(df_4h)
     
-    if best_4h:
+    # CORREÇÃO: Verificar se é None
+    if best_4h is not None:
         print("\n🏆 Rodando backtest final...")
         bt = BTCBacktest(
             timeframe='4h',
