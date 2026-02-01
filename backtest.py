@@ -27,15 +27,115 @@ class BTCBacktest:
         self.candle_size_multiplier = candle_size_multiplier
         self.take_profit_multiplier = take_profit_multiplier
         self.exit_first_profit = exit_first_profit
+    
+    def download_from_mexc(self, days):
+        """Baixa dados da MEXC API (mais fácil que Binance)"""
+        print(f"Baixando dados da MEXC...")
         
+        # Mapear timeframe
+        interval_map = {
+            '4h': '4h',
+            '1d': '1d', 
+            '1D': '1d',
+            '1wk': '1w',
+            '1W': '1w'
+        }
+        
+        interval = interval_map.get(self.timeframe, '1d')
+        
+        endpoint = 'https://api.mexc.com/api/v3/klines'
+        
+        all_data = []
+        limit = 1000  # MEXC permite 1000 por request
+        
+        # Calcular timestamps
+        end_time = int(time.time() * 1000)
+        
+        # Calcular quantas requests precisamos
+        if interval == '4h':
+            candles_per_day = 6
+        elif interval == '1d':
+            candles_per_day = 1
+        elif interval == '1w':
+            candles_per_day = 1/7
+        else:
+            candles_per_day = 1
+        
+        total_candles_needed = int(days * candles_per_day)
+        iterations = (total_candles_needed // limit) + 1
+        
+        print(f"  Buscando ~{total_candles_needed} candles em {iterations} requests...")
+        
+        for i in range(iterations):
+            params = {
+                'symbol': 'BTCUSDT',
+                'interval': interval,
+                'limit': limit,
+                'endTime': end_time
+            }
+            
+            try:
+                response = requests.get(endpoint, params=params, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                
+                if data and isinstance(data, list):
+                    all_data.extend(data)
+                    
+                    if len(data) < limit:
+                        break
+                    
+                    # Próximo batch - pega o timestamp do primeiro candle e subtrai 1ms
+                    end_time = data[0][0] - 1
+                    
+                    # Rate limiting
+                    time.sleep(0.2)
+                else:
+                    print(f"  Request {i+1}: Resposta vazia ou inválida")
+                    break
+                    
+            except Exception as e:
+                print(f"  Erro ao baixar chunk {i}: {str(e)}")
+                break
+        
+        if not all_data:
+            return None
+        
+        # Converter para DataFrame
+        df = pd.DataFrame(all_data, columns=[
+            'timestamp', 'Open', 'High', 'Low', 'Close', 'Volume',
+            'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+            'taker_buy_quote', 'ignore'
+        ])
+        
+        # Converter tipos
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            df[col] = df[col].astype(float)
+        
+        # Selecionar apenas colunas necessárias
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+        df = df.sort_index()
+        
+        # Remover duplicatas
+        df = df[~df.index.duplicated(keep='first')]
+        
+        return df
+    
     def download_from_cryptocompare(self, days):
         """Baixa dados do CryptoCompare API"""
         print(f"Baixando dados do CryptoCompare...")
         
-        if self.timeframe == '1d':
+        # Escolher endpoint baseado no timeframe
+        if self.timeframe in ['4h', '4H']:
+            endpoint = 'https://min-api.cryptocompare.com/data/v2/histohour'
+            limit = min(days * 6, 2000)  # 6 candles de 4h por dia
+        elif self.timeframe in ['1d', '1D']:
             endpoint = 'https://min-api.cryptocompare.com/data/v2/histoday'
             limit = min(days, 2000)
-        elif self.timeframe == '1wk':
+        elif self.timeframe in ['1wk', '1W']:
             endpoint = 'https://min-api.cryptocompare.com/data/v2/histoday'
             limit = min(days // 7, 2000)
         else:
@@ -45,13 +145,13 @@ class BTCBacktest:
         all_data = []
         to_timestamp = int(time.time())
         
-        iterations = (days // limit) + 1
+        iterations = (limit // 2000) + 1
         
         for i in range(iterations):
             params = {
                 'fsym': 'BTC',
                 'tsym': 'USD',
-                'limit': limit,
+                'limit': min(2000, limit - len(all_data)),
                 'toTs': to_timestamp
             }
             
@@ -64,7 +164,7 @@ class BTCBacktest:
                     df_chunk = pd.DataFrame(data['Data']['Data'])
                     all_data.append(df_chunk)
                     
-                    if len(df_chunk) < limit:
+                    if len(df_chunk) < 2000:
                         break
                     
                     to_timestamp = int(df_chunk['time'].min()) - 86400
@@ -96,7 +196,18 @@ class BTCBacktest:
         
         df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
         
-        if self.timeframe == '1wk':
+        # Agregar para 4h se necessário
+        if self.timeframe in ['4h', '4H'] and endpoint == 'histohour':
+            df = df.resample('4H').agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                'Volume': 'sum'
+            }).dropna()
+        
+        # Agregar para semanal se necessário
+        if self.timeframe in ['1wk', '1W']:
             df = df.resample('W').agg({
                 'Open': 'first',
                 'High': 'max',
@@ -111,12 +222,16 @@ class BTCBacktest:
         """Baixa dados da API pública da Binance"""
         print(f"Baixando dados da Binance...")
         
-        if self.timeframe == '1d':
-            interval = '1d'
-        elif self.timeframe == '1wk':
-            interval = '1w'
-        else:
-            interval = '1d'
+        # Mapear timeframe
+        interval_map = {
+            '4h': '4h',
+            '1d': '1d',
+            '1D': '1d',
+            '1wk': '1w',
+            '1W': '1w'
+        }
+        
+        interval = interval_map.get(self.timeframe, '1d')
         
         endpoint = 'https://api.binance.com/api/v3/klines'
         
@@ -124,7 +239,17 @@ class BTCBacktest:
         limit = 1000
         end_time = int(time.time() * 1000)
         
-        iterations = (days // limit) + 1
+        # Calcular iterações necessárias
+        if interval == '4h':
+            candles_needed = days * 6
+        elif interval == '1d':
+            candles_needed = days
+        elif interval == '1w':
+            candles_needed = days // 7
+        else:
+            candles_needed = days
+        
+        iterations = (candles_needed // limit) + 1
         
         for i in range(iterations):
             params = {
@@ -175,48 +300,73 @@ class BTCBacktest:
         return df
     
     def download_data(self, years=15):
-        """Baixa dados históricos do BTC"""
+        """Baixa dados históricos do BTC com múltiplas fontes"""
         days = years * 365
         df = None
         
+        # 1. Tentar MEXC primeiro (mais fácil)
+        try:
+            df = self.download_from_mexc(days)
+            if df is not None and len(df) > 100:
+                print(f"✅ MEXC: {len(df)} candles de {df.index[0]} até {df.index[-1]}")
+                return df
+        except Exception as e:
+            print(f"  MEXC falhou: {str(e)}")
+        
+        # 2. Tentar Binance
         try:
             df = self.download_from_binance(days)
             if df is not None and len(df) > 100:
+                print(f"✅ Binance: {len(df)} candles de {df.index[0]} até {df.index[-1]}")
                 return df
         except Exception as e:
             print(f"  Binance falhou: {str(e)}")
         
+        # 3. Tentar CryptoCompare
         try:
             df = self.download_from_cryptocompare(days)
             if df is not None and len(df) > 100:
+                print(f"✅ CryptoCompare: {len(df)} candles de {df.index[0]} até {df.index[-1]}")
                 return df
         except Exception as e:
             print(f"  CryptoCompare falhou: {str(e)}")
         
-        try:
-            import yfinance as yf
-            
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
-            
-            for ticker in ["BTC-USD", "BTCUSD=X"]:
-                try:
-                    data = yf.download(
-                        ticker,
-                        start=start_date,
-                        end=end_date,
-                        interval=self.timeframe,
-                        progress=False,
-                        auto_adjust=True
-                    )
-                    
-                    if not data.empty and len(data) > 100:
-                        df = data
-                        break
-                except:
-                    continue
-        except:
-            pass
+        # 4. Tentar yfinance como último recurso (não tem 4h)
+        if self.timeframe in ['1d', '1D', '1wk', '1W']:
+            try:
+                import yfinance as yf
+                
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=days)
+                
+                interval_map = {
+                    '1d': '1d',
+                    '1D': '1d',
+                    '1wk': '1wk',
+                    '1W': '1wk'
+                }
+                
+                interval = interval_map.get(self.timeframe, '1d')
+                
+                for ticker in ["BTC-USD", "BTCUSD=X"]:
+                    try:
+                        data = yf.download(
+                            ticker,
+                            start=start_date,
+                            end=end_date,
+                            interval=interval,
+                            progress=False,
+                            auto_adjust=True
+                        )
+                        
+                        if not data.empty and len(data) > 100:
+                            df = data
+                            print(f"✅ Yahoo Finance: {len(df)} candles")
+                            break
+                    except:
+                        continue
+            except Exception as e:
+                print(f"  yfinance falhou: {str(e)}")
         
         if df is None or df.empty:
             raise Exception("Não foi possível baixar dados de nenhuma fonte")
@@ -387,22 +537,20 @@ class BTCBacktest:
         df_equity['drawdown'] = (df_equity['equity'] - df_equity['cummax']) / df_equity['cummax'] * 100
         max_drawdown = df_equity['drawdown'].min()
         
-        df_trades['duration'] = (df_trades['exit_date'] - df_trades['entry_date']).dt.days
+        df_trades['duration'] = (df_trades['exit_date'] - df_trades['entry_date']).dt.total_seconds() / 3600  # horas
         
         returns = df_equity['equity'].pct_change().dropna()
         sharpe = (returns.mean() / returns.std() * np.sqrt(252)) if returns.std() != 0 else 0
         
         total_days = (df_equity['date'].max() - df_equity['date'].min()).days
-        days_in_market = df_trades['duration'].sum()
+        days_in_market = df_trades['duration'].sum() / 24
         time_in_market = (days_in_market / total_days * 100) if total_days > 0 else 0
         
-        # Cálculo de significância estatística
         n = len(self.trades)
         win_rate = (len(winning_trades) / n) * 100 if n > 0 else 0
         
-        # Intervalo de confiança (95%) para Win Rate
         if n >= 10:
-            z_score = 1.96  # 95% de confiança
+            z_score = 1.96
             p = win_rate / 100
             margin_error = z_score * np.sqrt((p * (1 - p)) / n) * 100
             ci_lower = max(0, win_rate - margin_error)
@@ -411,10 +559,9 @@ class BTCBacktest:
             ci_lower = 0
             ci_upper = 100
         
-        # Teste binomial (probabilidade de win rate > 50% ser sorte)
         if n >= 10:
             wins = len(winning_trades)
-            p_value = stats.binom_test(wins, n, 0.5, alternative='greater')
+            p_value = stats.binomtest(wins, n, 0.5, alternative='greater').pvalue
             statistically_significant = p_value < 0.05
         else:
             p_value = 1.0
@@ -454,6 +601,8 @@ class BTCBacktest:
     def print_results(self, metrics, show_full=True):
         """Imprime resultados do backtest"""
         if show_full:
+            duration_label = "horas" if self.timeframe == '4h' else "dias"
+            
             print("\n" + "="*70)
             print("RESULTADOS DO BACKTEST")
             print("="*70)
@@ -473,7 +622,7 @@ class BTCBacktest:
             else:
                 print(f"Significância:        ⚠️ NÃO (p={metrics['p_value']:.4f}) - Amostra pequena")
             
-            print(f"Duração Média:        {metrics['avg_trade_duration']:.1f} dias")
+            print(f"Duração Média:        {metrics['avg_trade_duration']:.1f} {duration_label}")
             print(f"Tempo em Mercado:     {metrics['time_in_market']:.1f}%")
             
             print(f"\n{'GANHOS/PERDAS':-^70}")
@@ -501,7 +650,7 @@ class BTCBacktest:
         fig = make_subplots(rows=3, cols=1, 
                            shared_xaxes=True,
                            vertical_spacing=0.03,
-                           subplot_titles=('Preço BTC e Média Móvel 8', 'Equity Curve', 'Drawdown'),
+                           subplot_titles=(f'Preço BTC ({self.timeframe}) e Média Móvel 8', 'Equity Curve', 'Drawdown'),
                            row_heights=[0.5, 0.3, 0.2])
         
         fig.add_trace(go.Candlestick(x=df.index,
@@ -598,7 +747,8 @@ class BTCBacktest:
         ax4.scatter(df_trades['duration'], df_trades['pnl_pct'], 
                    c=colors, alpha=0.6, s=100, edgecolors='black', linewidth=0.5)
         ax4.set_title('Duração vs Retorno', fontsize=12, fontweight='bold')
-        ax4.set_xlabel('Duração (dias)')
+        duration_label = 'horas' if self.timeframe == '4h' else 'dias'
+        ax4.set_xlabel(f'Duração ({duration_label})')
         ax4.set_ylabel('Retorno (%)')
         ax4.axhline(y=0, color='black', linestyle='--', linewidth=1)
         ax4.grid(True, alpha=0.3)
@@ -640,7 +790,9 @@ class BTCBacktest:
             f.write(f"Total de Trades:      {metrics['total_trades']}\n")
             f.write(f"Trades Vencedores:    {metrics['winning_trades']} ({metrics['win_rate']:.1f}%)\n")
             f.write(f"Trades Perdedores:    {metrics['losing_trades']} ({100-metrics['win_rate']:.1f}%)\n")
-            f.write(f"Duração Média:        {metrics['avg_trade_duration']:.1f} dias\n")
+            
+            duration_label = "horas" if self.timeframe == '4h' else "dias"
+            f.write(f"Duração Média:        {metrics['avg_trade_duration']:.1f} {duration_label}\n")
             f.write(f"Tempo em Mercado:     {metrics['time_in_market']:.1f}%\n\n")
             
             f.write(f"{'GANHOS/PERDAS':-^70}\n")
@@ -656,223 +808,55 @@ class BTCBacktest:
             f.write("="*70 + "\n")
 
 
-def statistical_optimization(df_data):
-    """Otimização focada em amostra estatisticamente significativa"""
+def test_4h_timeframe(df_data_4h):
+    """Testa configuração vencedora em 4H"""
     print("\n" + "="*70)
-    print("📊 OTIMIZAÇÃO COM FOCO EM SIGNIFICÂNCIA ESTATÍSTICA 📊")
+    print("🕐 TESTE EM 4 HORAS - CONFIGURAÇÃO VENCEDORA DO DIÁRIO")
     print("="*70)
-    print("\n🎯 Objetivo: Mínimo de 30 trades para confiabilidade")
-    print("   (Intervalo de confiança ±18% com 30 trades)")
-    print("   (Intervalo de confiança ±13% com 50 trades)\n")
+    print("\nAplicando config que deu 83.7% WR no diário:")
+    print("  Body: 0%, Candle Size: 1.5x, Exit: FirstProfit\n")
     
-    # Valores reduzidos para gerar mais trades
-    body_pct_values = [0, 30, 40, 45]
-    close_position_values = [0]
-    candle_size_values = [0, 1.0, 1.2, 1.5, 1.8]  # Removido 2.0+ (gera poucos trades)
-    take_profit_values = [0, 1.5, 2.0, 2.5]
-    exit_first_profit_values = [False, True]
+    bt_4h = BTCBacktest(
+        timeframe='4h',
+        ma_period=8,
+        initial_capital=10000,
+        body_pct_min=0,
+        close_position_min=0,
+        candle_size_multiplier=1.5,
+        exit_first_profit=True
+    )
     
-    results = []
-    total_combinations = (len(body_pct_values) * len(close_position_values) * 
-                         len(candle_size_values) * len(take_profit_values) *
-                         len(exit_first_profit_values))
-    current = 0
+    df_test = df_data_4h.copy()
+    df_test = bt_4h.calculate_candle_metrics(df_test)
+    df_test = bt_4h.calculate_ma(df_test)
+    bt_4h.run_backtest(df_test)
     
-    print(f"Total de combinações: {total_combinations}\n")
+    metrics, trades, equity = bt_4h.calculate_metrics()
+    bt_4h.print_results(metrics, show_full=True)
+    bt_4h.plot_results(df_test, equity, trades, '4h_test')
+    bt_4h.save_trades_csv(trades, '4h_test')
+    bt_4h.save_summary(metrics, '4h_test', {
+        'body_pct': 0,
+        'close_pos': 0,
+        'size_mult': 1.5,
+        'tp_mult': 0,
+        'exit_fp': True
+    })
     
-    for body_pct, close_pos, size_mult, tp_mult, exit_fp in product(
-        body_pct_values, close_position_values, candle_size_values, 
-        take_profit_values, exit_first_profit_values):
-        
-        current += 1
-        
-        if exit_fp and tp_mult > 0:
-            continue
-        
-        bt = BTCBacktest(
-            timeframe='1d',
-            ma_period=8,
-            initial_capital=10000,
-            body_pct_min=body_pct,
-            close_position_min=close_pos,
-            candle_size_multiplier=size_mult,
-            take_profit_multiplier=tp_mult,
-            exit_first_profit=exit_fp
-        )
-        
-        df_test = df_data.copy()
-        df_test = bt.calculate_candle_metrics(df_test)
-        df_test = bt.calculate_ma(df_test)
-        bt.run_backtest(df_test)
-        
-        metrics, trades, equity = bt.calculate_metrics()
-        
-        # Exigir mínimo de 30 trades para significância
-        if metrics['total_trades'] >= 30:
-            exit_strategy = "FirstProfit" if exit_fp else (f"TP{tp_mult}x" if tp_mult > 0 else "MA")
-            
-            results.append({
-                'body_pct': body_pct,
-                'close_position': close_pos,
-                'candle_size_mult': size_mult,
-                'take_profit_mult': tp_mult,
-                'exit_first_profit': exit_fp,
-                'exit_strategy': exit_strategy,
-                **metrics
-            })
-            
-            bt.print_results(metrics, show_full=False)
-    
-    df_results = pd.DataFrame(results)
-    
-    if df_results.empty:
-        print("\n⚠️ Nenhuma configuração com 30+ trades encontrada!")
-        print("Tentando com mínimo de 20 trades...\n")
-        # Tentar novamente com 20 trades
-        return statistical_optimization_relaxed(df_data)
-    
-    print(f"\n✅ Otimização concluída! {len(df_results)} configurações válidas.\n")
-    
-    # Salvar resultados
-    os.makedirs('results/optimization', exist_ok=True)
-    df_results.to_csv('results/optimization/statistical_optimization.csv', index=False)
-    
-    # === RANKING 1: Estatisticamente Significante ===
-    print("\n" + "="*100)
-    print("✅ TOP 20 - ESTATISTICAMENTE SIGNIFICANTES (p < 0.05)")
-    print("="*100)
-    
-    df_significant = df_results[df_results['statistically_significant'] == True].sort_values('win_rate', ascending=False)
-    
-    if df_significant.empty:
-        print("⚠️ Nenhuma configuração estatisticamente significante encontrada.")
-        print("   Isso significa que mesmo com 30+ trades, a win rate pode ser sorte.\n")
-        df_significant = df_results.sort_values('win_rate', ascending=False)
-    
-    print(f"{'#':<3} {'Body%':<6} {'Size':<5} {'Exit':<11} {'Trades':<7} {'WR%':<7} "
-          f"{'IC 95%':<18} {'Exp%':<7} {'PF':<5} {'p-val':<7} {'Sig':<4}")
-    print("-"*100)
-    
-    for idx, row in df_significant.head(20).iterrows():
-        ci_range = f"[{row['win_rate_ci_lower']:.1f}%-{row['win_rate_ci_upper']:.1f}%]"
-        sig = "✅" if row['statistically_significant'] else "⚠️"
-        print(f"{df_significant.index.get_loc(idx)+1:<3} "
-              f"{row['body_pct']:<6.0f} "
-              f"{row['candle_size_mult']:<5.1f} "
-              f"{row['exit_strategy']:<11} "
-              f"{row['total_trades']:<7.0f} "
-              f"{row['win_rate']:<7.1f} "
-              f"{ci_range:<18} "
-              f"{row['expectancy_pct']:<7.2f} "
-              f"{row['profit_factor']:<5.2f} "
-              f"{row['p_value']:<7.4f} "
-              f"{sig:<4}")
-    
-    # === RANKING 2: Maior Número de Trades ===
-    print("\n" + "="*100)
-    print("📊 TOP 20 - MAIOR AMOSTRA (mais trades = mais confiável)")
-    print("="*100)
-    
-    df_by_trades = df_results.sort_values('total_trades', ascending=False)
-    print(f"{'#':<3} {'Body%':<6} {'Size':<5} {'Exit':<11} {'Trades':<7} {'WR%':<7} "
-          f"{'IC 95%':<18} {'Exp%':<7} {'PF':<5} {'Sig':<4}")
-    print("-"*100)
-    
-    for idx, row in df_by_trades.head(20).iterrows():
-        ci_range = f"[{row['win_rate_ci_lower']:.1f}%-{row['win_rate_ci_upper']:.1f}%]"
-        sig = "✅" if row['statistically_significant'] else "⚠️"
-        print(f"{df_by_trades.index.get_loc(idx)+1:<3} "
-              f"{row['body_pct']:<6.0f} "
-              f"{row['candle_size_mult']:<5.1f} "
-              f"{row['exit_strategy']:<11} "
-              f"{row['total_trades']:<7.0f} "
-              f"{row['win_rate']:<7.1f} "
-              f"{ci_range:<18} "
-              f"{row['expectancy_pct']:<7.2f} "
-              f"{row['profit_factor']:<5.2f} "
-              f"{sig:<4}")
-    
-    # === RANKING 3: Melhor Win Rate (com trades suficientes) ===
-    print("\n" + "="*100)
-    print("🏆 TOP 20 - MAIOR WIN RATE (mínimo 30 trades)")
-    print("="*100)
-    
-    df_by_wr = df_results.sort_values('win_rate', ascending=False)
-    print(f"{'#':<3} {'Body%':<6} {'Size':<5} {'Exit':<11} {'Trades':<7} {'WR%':<7} "
-          f"{'IC 95%':<18} {'Exp%':<7} {'Ret%':<10} {'PF':<5}")
-    print("-"*100)
-    
-    for idx, row in df_by_wr.head(20).iterrows():
-        ci_range = f"[{row['win_rate_ci_lower']:.1f}%-{row['win_rate_ci_upper']:.1f}%]"
-        print(f"{df_by_wr.index.get_loc(idx)+1:<3} "
-              f"{row['body_pct']:<6.0f} "
-              f"{row['candle_size_mult']:<5.1f} "
-              f"{row['exit_strategy']:<11} "
-              f"{row['total_trades']:<7.0f} "
-              f"{row['win_rate']:<7.1f} "
-              f"{ci_range:<18} "
-              f"{row['expectancy_pct']:<7.2f} "
-              f"{row['total_return']:<10.2f} "
-              f"{row['profit_factor']:<5.2f}")
-    
-    # Melhor configuração (balanceada + significante)
-    if not df_significant.empty:
-        best = df_significant.iloc[0]
-    else:
-        best = df_by_wr.iloc[0]
-    
-    print("\n" + "="*70)
-    print("🎯 CONFIGURAÇÃO RECOMENDADA (Estatisticamente Confiável)")
-    print("="*70)
-    print(f"Body % mínimo:          {best['body_pct']:.0f}%")
-    print(f"Candle Size multiplier: {best['candle_size_mult']:.1f}x")
-    print(f"Estratégia de Saída:    {best['exit_strategy']}")
-    
-    print(f"\n📈 RESULTADOS:")
-    print(f"Total de Trades:        {best['total_trades']:.0f} ✅")
-    print(f"Win Rate:               {best['win_rate']:.2f}%")
-    print(f"Intervalo Confiança:    [{best['win_rate_ci_lower']:.1f}%, {best['win_rate_ci_upper']:.1f}%]")
-    print(f"P-value:                {best['p_value']:.4f}")
-    
-    if best['statistically_significant']:
-        print(f"Significância:          ✅ SIM - Win rate > 50% não é sorte!")
-    else:
-        print(f"Significância:          ⚠️ NÃO - Precisa mais trades para confirmar")
-    
-    print(f"\nExpectância:            {best['expectancy_pct']:.2f}% por trade")
-    print(f"Profit Factor:          {best['profit_factor']:.2f}")
-    print(f"Retorno Total:          {best['total_return']:.2f}%")
-    print(f"Max Drawdown:           {best['max_drawdown']:.2f}%")
-    print("="*70)
-    
-    # Análise por número de trades
-    print("\n" + "="*70)
-    print("📊 ANÁLISE: IMPACTO DO TAMANHO DA AMOSTRA")
-    print("="*70)
-    
-    trade_ranges = [(30, 50), (50, 75), (75, 100), (100, 200), (200, 1000)]
-    for min_t, max_t in trade_ranges:
-        subset = df_results[(df_results['total_trades'] >= min_t) & 
-                           (df_results['total_trades'] < max_t)]
-        if len(subset) > 0:
-            avg_wr = subset['win_rate'].mean()
-            avg_ci_width = (subset['win_rate_ci_upper'] - subset['win_rate_ci_lower']).mean()
-            sig_pct = (subset['statistically_significant'].sum() / len(subset)) * 100
-            print(f"{min_t:3d}-{max_t:3d} trades: {len(subset):3d} configs | "
-                  f"WR médio: {avg_wr:5.1f}% | IC largura: ±{avg_ci_width/2:4.1f}% | "
-                  f"Significantes: {sig_pct:5.1f}%")
-    
-    return best
+    return metrics
 
 
-def statistical_optimization_relaxed(df_data):
-    """Versão relaxada com mínimo de 20 trades"""
-    print("Executando otimização relaxada (mín. 20 trades)...\n")
+def optimize_4h(df_data_4h):
+    """Otimiza especificamente para 4H"""
+    print("\n" + "="*70)
+    print("🔧 OTIMIZAÇÃO ESPECÍFICA PARA 4 HORAS")
+    print("="*70)
+    print("\nTestando configurações adaptadas para 4H...\n")
     
-    # Usar mesmos parâmetros mas aceitar 20+ trades
+    # Valores para 4H
     body_pct_values = [0, 30, 40]
     close_position_values = [0]
-    candle_size_values = [0, 1.0, 1.2, 1.5]
+    candle_size_values = [0, 1.0, 1.2, 1.5, 1.8]
     take_profit_values = [0, 1.5, 2.0]
     exit_first_profit_values = [False, True]
     
@@ -886,7 +870,7 @@ def statistical_optimization_relaxed(df_data):
             continue
         
         bt = BTCBacktest(
-            timeframe='1d',
+            timeframe='4h',
             ma_period=8,
             initial_capital=10000,
             body_pct_min=body_pct,
@@ -896,90 +880,140 @@ def statistical_optimization_relaxed(df_data):
             exit_first_profit=exit_fp
         )
         
-        df_test = df_data.copy()
+        df_test = df_data_4h.copy()
         df_test = bt.calculate_candle_metrics(df_test)
         df_test = bt.calculate_ma(df_test)
         bt.run_backtest(df_test)
         
         metrics, trades, equity = bt.calculate_metrics()
         
-        if metrics['total_trades'] >= 20:
+        if metrics['total_trades'] >= 30:
             exit_strategy = "FirstProfit" if exit_fp else (f"TP{tp_mult}x" if tp_mult > 0 else "MA")
             
             results.append({
                 'body_pct': body_pct,
-                'close_position': close_pos,
                 'candle_size_mult': size_mult,
                 'take_profit_mult': tp_mult,
                 'exit_first_profit': exit_fp,
                 'exit_strategy': exit_strategy,
                 **metrics
             })
+            
+            bt.print_results(metrics, show_full=False)
     
     df_results = pd.DataFrame(results)
     
     if df_results.empty:
-        print("⚠️ Nenhuma configuração com 20+ trades encontrada!")
+        print("\n⚠️ Nenhuma configuração com 30+ trades encontrada!")
         return None
     
-    best = df_results.sort_values('win_rate', ascending=False).iloc[0]
+    # Salvar
+    os.makedirs('results/optimization', exist_ok=True)
+    df_results.to_csv('results/optimization/4h_optimization.csv', index=False)
     
-    print(f"\n✅ Melhor configuração (mín. 20 trades):")
-    print(f"   Body: {best['body_pct']:.0f}%, Size: {best['candle_size_mult']:.1f}x, Exit: {best['exit_strategy']}")
-    print(f"   Trades: {best['total_trades']:.0f}, WR: {best['win_rate']:.1f}%")
+    # Top 10
+    print("\n" + "="*90)
+    print("🏆 TOP 10 - TIMEFRAME 4H")
+    print("="*90)
+    
+    df_by_wr = df_results.sort_values('win_rate', ascending=False)
+    print(f"{'#':<3} {'Body%':<6} {'Size':<5} {'Exit':<11} {'Trades':<7} {'WR%':<7} "
+          f"{'Exp%':<7} {'Ret%':<10} {'PF':<5} {'Sig':<4}")
+    print("-"*90)
+    
+    for idx, row in df_by_wr.head(10).iterrows():
+        sig = "✅" if row['statistically_significant'] else "⚠️"
+        print(f"{df_by_wr.index.get_loc(idx)+1:<3} "
+              f"{row['body_pct']:<6.0f} "
+              f"{row['candle_size_mult']:<5.1f} "
+              f"{row['exit_strategy']:<11} "
+              f"{row['total_trades']:<7.0f} "
+              f"{row['win_rate']:<7.1f} "
+              f"{row['expectancy_pct']:<7.2f} "
+              f"{row['total_return']:<10.2f} "
+              f"{row['profit_factor']:<5.2f} "
+              f"{sig:<4}")
+    
+    best = df_by_wr.iloc[0]
+    
+    print("\n" + "="*70)
+    print("🎯 MELHOR CONFIGURAÇÃO 4H")
+    print("="*70)
+    print(f"Body % mínimo:          {best['body_pct']:.0f}%")
+    print(f"Candle Size multiplier: {best['candle_size_mult']:.1f}x")
+    print(f"Estratégia de Saída:    {best['exit_strategy']}")
+    print(f"\nWin Rate:               {best['win_rate']:.2f}%")
+    print(f"Total Trades:           {best['total_trades']:.0f}")
+    print(f"Expectância:            {best['expectancy_pct']:.2f}%")
+    print(f"Retorno Total:          {best['total_return']:.2f}%")
+    print(f"Profit Factor:          {best['profit_factor']:.2f}")
+    print("="*70)
     
     return best
 
 
 def main():
     print("="*70)
-    print("📊 BACKTEST BTC - OTIMIZAÇÃO ESTATÍSTICA 📊")
+    print("📊 BACKTEST BTC - TIMEFRAME 4 HORAS 📊")
     print("="*70)
     
-    print("\nBaixando dados...")
-    bt_temp = BTCBacktest(timeframe='1d', ma_period=8, initial_capital=10000)
-    df_daily = bt_temp.download_data(years=15)
-    print(f"✅ Dados baixados: {len(df_daily)} candles\n")
+    # Baixar dados 4H
+    print("\nBaixando dados 4H...")
+    bt_temp = BTCBacktest(timeframe='4h', ma_period=8, initial_capital=10000)
     
-    # Otimização estatística
-    best_config = statistical_optimization(df_daily)
+    try:
+        df_4h = bt_temp.download_data(years=5)  # 5 anos de 4H = ~11k candles
+        print(f"✅ Dados 4H carregados com sucesso!\n")
+    except Exception as e:
+        print(f"❌ Erro ao baixar dados 4H: {str(e)}")
+        return
     
-    if best_config is not None:
+    # Teste com config vencedora do diário
+    metrics_test = test_4h_timeframe(df_4h)
+    
+    # Otimização específica para 4H
+    best_4h = optimize_4h(df_4h)
+    
+    if best_4h is not None:
         print("\n" + "="*70)
-        print("🏆 EXECUTANDO BACKTEST FINAL")
+        print("🏆 EXECUTANDO BACKTEST FINAL 4H")
         print("="*70)
         
         bt_best = BTCBacktest(
-            timeframe='1d',
+            timeframe='4h',
             ma_period=8,
             initial_capital=10000,
-            body_pct_min=best_config['body_pct'],
-            close_position_min=best_config['close_position'],
-            candle_size_multiplier=best_config['candle_size_mult'],
-            take_profit_multiplier=best_config['take_profit_mult'],
-            exit_first_profit=best_config['exit_first_profit']
+            body_pct_min=best_4h['body_pct'],
+            close_position_min=0,
+            candle_size_multiplier=best_4h['candle_size_mult'],
+            take_profit_multiplier=best_4h['take_profit_mult'],
+            exit_first_profit=best_4h['exit_first_profit']
         )
         
-        df_daily_best = df_daily.copy()
-        df_daily_best = bt_best.calculate_candle_metrics(df_daily_best)
-        df_daily_best = bt_best.calculate_ma(df_daily_best)
-        bt_best.run_backtest(df_daily_best)
+        df_4h_best = df_4h.copy()
+        df_4h_best = bt_best.calculate_candle_metrics(df_4h_best)
+        df_4h_best = bt_best.calculate_ma(df_4h_best)
+        bt_best.run_backtest(df_4h_best)
         
         metrics_best, trades_best, equity_best = bt_best.calculate_metrics()
         bt_best.print_results(metrics_best, show_full=True)
-        bt_best.plot_results(df_daily_best, equity_best, trades_best, 'daily_optimized')
-        bt_best.save_trades_csv(trades_best, 'daily_optimized')
-        bt_best.save_summary(metrics_best, 'daily_optimized', {
-            'body_pct': best_config['body_pct'],
-            'close_pos': best_config['close_position'],
-            'size_mult': best_config['candle_size_mult'],
-            'tp_mult': best_config['take_profit_mult'],
-            'exit_fp': best_config['exit_first_profit']
+        bt_best.plot_results(df_4h_best, equity_best, trades_best, '4h_optimized')
+        bt_best.save_trades_csv(trades_best, '4h_optimized')
+        bt_best.save_summary(metrics_best, '4h_optimized', {
+            'body_pct': best_4h['body_pct'],
+            'close_pos': 0,
+            'size_mult': best_4h['candle_size_mult'],
+            'tp_mult': best_4h['take_profit_mult'],
+            'exit_fp': best_4h['exit_first_profit']
         })
     
     print("\n" + "="*70)
-    print("✅ BACKTEST CONCLUÍDO!")
+    print("✅ BACKTEST 4H CONCLUÍDO!")
     print("="*70)
+    print("\nResultados salvos em:")
+    print("  • results/4h_test/       (config diário aplicada em 4H)")
+    print("  • results/4h_optimized/  (config otimizada para 4H)")
+    print("  • results/optimization/4h_optimization.csv")
 
 
 if __name__ == "__main__":
