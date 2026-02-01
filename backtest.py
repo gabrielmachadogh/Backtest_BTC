@@ -1,4 +1,3 @@
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -7,6 +6,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
 import time
+import requests
 
 class BTCBacktest:
     def __init__(self, timeframe='1d', ma_period=8, initial_capital=10000):
@@ -18,77 +18,220 @@ class BTCBacktest:
         self.trades = []
         self.equity_curve = []
         
-    def download_data(self, years=15, max_retries=3):
-        """Baixa dados históricos do BTC com retry"""
+    def download_from_cryptocompare(self, days):
+        """Baixa dados do CryptoCompare API (gratuito, sem necessidade de API key)"""
+        print(f"Baixando dados do CryptoCompare...")
+        
+        if self.timeframe == '1d':
+            endpoint = 'https://min-api.cryptocompare.com/data/v2/histoday'
+            limit = min(days, 2000)  # Máximo por requisição
+        elif self.timeframe == '1wk':
+            endpoint = 'https://min-api.cryptocompare.com/data/v2/histoday'
+            limit = min(days // 7, 2000)
+        else:
+            endpoint = 'https://min-api.cryptocompare.com/data/v2/histoday'
+            limit = min(days, 2000)
+        
+        all_data = []
+        to_timestamp = int(time.time())
+        
+        # Fazer múltiplas requisições se necessário
+        iterations = (days // limit) + 1
+        
+        for i in range(iterations):
+            params = {
+                'fsym': 'BTC',
+                'tsym': 'USD',
+                'limit': limit,
+                'toTs': to_timestamp
+            }
+            
+            try:
+                response = requests.get(endpoint, params=params, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                
+                if data['Response'] == 'Success':
+                    df_chunk = pd.DataFrame(data['Data']['Data'])
+                    all_data.append(df_chunk)
+                    
+                    if len(df_chunk) < limit:
+                        break
+                    
+                    to_timestamp = int(df_chunk['time'].min()) - 86400
+                    time.sleep(1)  # Rate limiting
+                else:
+                    print(f"  Erro na API: {data.get('Message', 'Unknown')}")
+                    break
+                    
+            except Exception as e:
+                print(f"  Erro ao baixar chunk {i}: {str(e)}")
+                break
+        
+        if not all_data:
+            return None
+        
+        # Combinar todos os chunks
+        df = pd.concat(all_data, ignore_index=True)
+        df = df.sort_values('time')
+        df = df.drop_duplicates(subset=['time'])
+        
+        # Converter timestamp para datetime
+        df['Date'] = pd.to_datetime(df['time'], unit='s')
+        df.set_index('Date', inplace=True)
+        
+        # Renomear colunas para o padrão
+        df = df.rename(columns={
+            'open': 'Open',
+            'high': 'High',
+            'low': 'Low',
+            'close': 'Close',
+            'volumefrom': 'Volume'
+        })
+        
+        # Selecionar apenas colunas necessárias
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+        
+        # Converter para semanal se necessário
+        if self.timeframe == '1wk':
+            df = df.resample('W').agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                'Volume': 'sum'
+            }).dropna()
+        
+        return df
+    
+    def download_from_binance(self, days):
+        """Baixa dados da API pública da Binance"""
+        print(f"Baixando dados da Binance...")
+        
+        if self.timeframe == '1d':
+            interval = '1d'
+        elif self.timeframe == '1wk':
+            interval = '1w'
+        else:
+            interval = '1d'
+        
+        endpoint = 'https://api.binance.com/api/v3/klines'
+        
+        all_data = []
+        limit = 1000  # Máximo por requisição
+        end_time = int(time.time() * 1000)
+        
+        iterations = (days // limit) + 1
+        
+        for i in range(iterations):
+            params = {
+                'symbol': 'BTCUSDT',
+                'interval': interval,
+                'limit': limit,
+                'endTime': end_time
+            }
+            
+            try:
+                response = requests.get(endpoint, params=params, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                
+                if data:
+                    all_data.extend(data)
+                    
+                    if len(data) < limit:
+                        break
+                    
+                    end_time = data[0][0] - 1
+                    time.sleep(0.5)  # Rate limiting
+                else:
+                    break
+                    
+            except Exception as e:
+                print(f"  Erro ao baixar chunk {i}: {str(e)}")
+                break
+        
+        if not all_data:
+            return None
+        
+        # Converter para DataFrame
+        df = pd.DataFrame(all_data, columns=[
+            'timestamp', 'Open', 'High', 'Low', 'Close', 'Volume',
+            'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+            'taker_buy_quote', 'ignore'
+        ])
+        
+        # Converter tipos
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            df[col] = df[col].astype(float)
+        
+        # Selecionar apenas colunas necessárias
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+        df = df.sort_index()
+        
+        return df
+    
+    def download_data(self, years=15):
+        """Baixa dados históricos do BTC com múltiplas fontes"""
         print(f"Baixando dados BTC ({self.timeframe}) dos últimos {years} anos...")
         
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=years*365)
-        
-        # Lista de tickers alternativos
-        tickers = ["BTC-USD", "BTCUSD=X"]
-        
+        days = years * 365
         df = None
-        for ticker in tickers:
-            for attempt in range(max_retries):
+        
+        # Tentar Binance primeiro (mais confiável em CI/CD)
+        try:
+            df = self.download_from_binance(days)
+            if df is not None and len(df) > 100:
+                print(f"✓ Dados baixados da Binance: {len(df)} candles")
+                print(f"  Período: {df.index[0]} até {df.index[-1]}")
+                return df
+        except Exception as e:
+            print(f"  Binance falhou: {str(e)}")
+        
+        # Tentar CryptoCompare
+        try:
+            df = self.download_from_cryptocompare(days)
+            if df is not None and len(df) > 100:
+                print(f"✓ Dados baixados do CryptoCompare: {len(df)} candles")
+                print(f"  Período: {df.index[0]} até {df.index[-1]}")
+                return df
+        except Exception as e:
+            print(f"  CryptoCompare falhou: {str(e)}")
+        
+        # Tentar yfinance como último recurso
+        try:
+            import yfinance as yf
+            
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days)
+            
+            for ticker in ["BTC-USD", "BTCUSD=X"]:
                 try:
-                    print(f"Tentativa {attempt + 1}/{max_retries} para {ticker}...")
-                    
-                    # Download com configurações específicas
+                    print(f"  Tentando yfinance com {ticker}...")
                     data = yf.download(
-                        ticker, 
-                        start=start_date, 
-                        end=end_date, 
+                        ticker,
+                        start=start_date,
+                        end=end_date,
                         interval=self.timeframe,
                         progress=False,
-                        auto_adjust=True,
-                        prepost=False,
-                        threads=True,
-                        proxy=None
+                        auto_adjust=True
                     )
                     
                     if not data.empty and len(data) > 100:
                         df = data
-                        print(f"✓ Dados baixados com sucesso usando {ticker}")
-                        print(f"  {len(df)} candles de {df.index[0]} até {df.index[-1]}")
+                        print(f"✓ Dados baixados do yfinance: {len(df)} candles")
                         break
-                    else:
-                        print(f"  Dados insuficientes ou vazios")
-                        
                 except Exception as e:
-                    print(f"  Erro: {str(e)}")
-                    if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 2
-                        print(f"  Aguardando {wait_time}s antes de tentar novamente...")
-                        time.sleep(wait_time)
-            
-            if df is not None and not df.empty:
-                break
+                    print(f"    {ticker} falhou: {str(e)}")
+                    continue
+        except Exception as e:
+            print(f"  yfinance falhou: {str(e)}")
         
         if df is None or df.empty:
-            raise Exception("Não foi possível baixar dados após todas as tentativas")
-        
-        # Renomear colunas se necessário
-        df.columns = df.columns.str.strip()
-        column_mapping = {
-            'Open': 'Open',
-            'High': 'High', 
-            'Low': 'Low',
-            'Close': 'Close',
-            'Volume': 'Volume'
-        }
-        
-        # Se as colunas já estão corretas
-        if 'Close' in df.columns:
-            return df
-        
-        # Se vieram em minúsculas ou com o ticker
-        for col in df.columns:
-            col_clean = col.split()[0] if ' ' in col else col
-            for std_name in column_mapping.keys():
-                if std_name.lower() in col.lower():
-                    df.rename(columns={col: std_name}, inplace=True)
-                    break
+            raise Exception("Não foi possível baixar dados de nenhuma fonte")
         
         return df
     
@@ -98,8 +241,8 @@ class BTCBacktest:
         
         # Detecta quando a MA vira para cima ou para baixo
         df['MA_Direction'] = 0
-        df.loc[df['MA8'] > df['MA8'].shift(1), 'MA_Direction'] = 1  # Virando pra cima
-        df.loc[df['MA8'] < df['MA8'].shift(1), 'MA_Direction'] = -1  # Virando pra baixo
+        df.loc[df['MA8'] > df['MA8'].shift(1), 'MA_Direction'] = 1
+        df.loc[df['MA8'] < df['MA8'].shift(1), 'MA_Direction'] = -1
         
         # Marca candle que virou
         df['MA_Turn_Up'] = (df['MA_Direction'] == 1) & (df['MA_Direction'].shift(1) != 1)
@@ -126,7 +269,7 @@ class BTCBacktest:
                 if df.loc[df.index[i-1], 'MA_Turn_Up']:
                     entry_trigger = df.loc[df.index[i-1], 'High']
                     stop_loss = df.loc[df.index[i-1], 'Low']
-                    print(f"\n[{current_idx.strftime('%Y-%m-%d')}] MA virou para CIMA - Gatilho: ${entry_trigger:.2f}, Stop: ${stop_loss:.2f}")
+                    print(f"\n[{current_idx.strftime('%Y-%m-%d')}] MA virou CIMA - Gatilho: ${entry_trigger:.2f}")
                 
                 # Tenta entrar se romper o gatilho
                 if entry_trigger and current_price >= entry_trigger:
@@ -137,7 +280,7 @@ class BTCBacktest:
                         'quantity': quantity,
                         'stop_loss': stop_loss
                     }
-                    print(f"[{current_idx.strftime('%Y-%m-%d')}] ENTRADA ${entry_trigger:.2f} | Qtd: {quantity:.6f} BTC")
+                    print(f"    ENTRADA ${entry_trigger:.2f} | Qtd: {quantity:.6f} BTC")
                     entry_trigger = None
                     
             # Verifica se está em posição
@@ -152,11 +295,11 @@ class BTCBacktest:
                 # Detecta virada da MA para baixo
                 if df.loc[df.index[i-1], 'MA_Turn_Down']:
                     exit_trigger = df.loc[df.index[i-1], 'Low']
-                    print(f"\n[{current_idx.strftime('%Y-%m-%d')}] MA virou para BAIXO - Gatilho saída: ${exit_trigger:.2f}")
+                    print(f"\n[{current_idx.strftime('%Y-%m-%d')}] MA virou BAIXO - Gatilho saída: ${exit_trigger:.2f}")
                 
                 # Desarma saída se MA virar para cima novamente
                 if df.loc[df.index[i-1], 'MA_Turn_Up'] and exit_trigger:
-                    print(f"[{current_idx.strftime('%Y-%m-%d')}] MA virou CIMA - DESARMANDO saída")
+                    print(f"    DESARMANDO saída (MA virou CIMA)")
                     exit_trigger = None
                 
                 # Tenta sair se atingir o gatilho
@@ -202,7 +345,7 @@ class BTCBacktest:
         }
         
         self.trades.append(trade)
-        print(f"[{exit_date.strftime('%Y-%m-%d')}] SAÍDA ${exit_price:.2f} | {reason} | PnL: ${pnl:.2f} ({pnl_pct:.2f}%)")
+        print(f"    SAÍDA ${exit_price:.2f} | {reason} | PnL: ${pnl:.2f} ({pnl_pct:.2f}%)")
         
         self.position = None
     
@@ -416,4 +559,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
