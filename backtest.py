@@ -29,71 +29,115 @@ class BTCBacktest:
         self.exit_first_profit = exit_first_profit
         self.exit_on_ma_turn = exit_on_ma_turn
     
-    def download_from_coingecko(self):
-        """Download Coingecko API (GRÁTIS, SEM API KEY)"""
-        print(f"Baixando Coingecko API (dados desde 2020)...")
+    def download_from_binance_requests(self):
+        """Download Binance via requests (contorna bloqueio)"""
+        print(f"Baixando Binance via requests (4h desde 2020)...")
         
         try:
-            # Desde 2020 até agora
-            start_timestamp = int(datetime(2020, 1, 1).timestamp())
-            end_timestamp = int(datetime.now().timestamp())
+            # URL base
+            base_url = "https://data-api.binance.vision/api/v3/klines"
             
-            # API Coingecko (sem API key necessária)
-            url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range"
-            params = {
-                'vs_currency': 'usd',
-                'from': start_timestamp,
-                'to': end_timestamp
-            }
+            # Parâmetros
+            symbol = "BTCUSDT"
+            interval = "4h"
+            limit = 1000
             
-            print(f"  Buscando dados de {datetime.fromtimestamp(start_timestamp)} até {datetime.fromtimestamp(end_timestamp)}...")
+            # Desde 01/01/2020
+            start_time = int(datetime(2020, 1, 1).timestamp() * 1000)
+            end_time = int(datetime.now().timestamp() * 1000)
             
-            response = requests.get(url, params=params, timeout=60)
-            response.raise_for_status()
-            data = response.json()
+            all_data = []
+            current_start = start_time
             
-            if 'prices' not in data:
+            print(f"  Período: 2020-01-01 até agora")
+            print(f"  Buscando em lotes de {limit} candles...")
+            
+            iterations = 0
+            max_iterations = 100  # Segurança
+            
+            while current_start < end_time and iterations < max_iterations:
+                params = {
+                    'symbol': symbol,
+                    'interval': interval,
+                    'startTime': current_start,
+                    'limit': limit
+                }
+                
+                try:
+                    response = requests.get(base_url, params=params, timeout=30)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        
+                        if not data or len(data) == 0:
+                            break
+                        
+                        all_data.extend(data)
+                        
+                        # Próximo lote: começar após o último timestamp
+                        current_start = data[-1][0] + 1
+                        
+                        iterations += 1
+                        
+                        if iterations % 10 == 0:
+                            print(f"    Baixados {len(all_data)} candles...")
+                        
+                        time.sleep(0.1)  # Rate limiting
+                        
+                        if len(data) < limit:
+                            break
+                    else:
+                        print(f"  Erro HTTP {response.status_code}")
+                        break
+                        
+                except Exception as e:
+                    print(f"  Erro na request: {str(e)}")
+                    break
+            
+            if not all_data:
                 return None
             
+            print(f"  Total baixado: {len(all_data)} candles")
+            
             # Converter para DataFrame
-            prices = data['prices']
-            df = pd.DataFrame(prices, columns=['timestamp', 'close'])
+            df = pd.DataFrame(all_data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+                'taker_buy_quote', 'ignore'
+            ])
+            
+            # Converter tipos
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
             
-            # Coingecko retorna dados de 1h quando período > 90 dias
-            print(f"  Recebidos {len(df)} pontos de dados")
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = df[col].astype(float)
             
-            # Criar OHLC a partir dos dados de close (aproximação)
-            # Resample para 1H primeiro
-            df_1h = df.resample('1H').agg({
-                'close': 'last'
-            }).fillna(method='ffill')
+            # Renomear colunas
+            df = df.rename(columns={
+                'open': 'Open',
+                'high': 'High',
+                'low': 'Low',
+                'close': 'Close',
+                'volume': 'Volume'
+            })
             
-            # Criar OHLC artificial (baseado em close)
-            df_1h['Open'] = df_1h['close']
-            df_1h['High'] = df_1h['close'] * 1.001  # Aproximação
-            df_1h['Low'] = df_1h['close'] * 0.999   # Aproximação
-            df_1h['Close'] = df_1h['close']
-            df_1h['Volume'] = 1  # Placeholder
+            df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
             
-            # Agregar para 4H
-            print(f"  Agregando para 4H...")
-            df_4h = df_1h.resample('4H').agg({
-                'Open': 'first',
-                'High': 'max',
-                'Low': 'min',
-                'Close': 'last',
-                'Volume': 'sum'
-            }).dropna()
+            # Filtrar apenas passado
+            now = pd.Timestamp.now()
+            df = df[df.index <= now]
             
-            print(f"  Resultado: {len(df_4h)} candles de 4H")
-            print(f"  Período: {df_4h.index[0]} até {df_4h.index[-1]}")
+            # Desde 2020
+            min_date = pd.Timestamp('2020-01-01')
+            df = df[df.index >= min_date]
             
-            return df_4h[['Open', 'High', 'Low', 'Close', 'Volume']]
+            print(f"  Período final: {df.index[0]} até {df.index[-1]}")
+            
+            return df
             
         except Exception as e:
-            print(f"  Coingecko falhou: {str(e)}")
+            print(f"  Binance requests falhou: {str(e)}")
             return None
     
     def download_data(self, years=5):
@@ -102,9 +146,9 @@ class BTCBacktest:
         
         print(f"Baixando dados 4H desde 2020...")
         
-        # Coingecko (mais confiável para histórico)
+        # Binance via requests (mais confiável)
         try:
-            df = self.download_from_coingecko()
+            df = self.download_from_binance_requests()
             if df is not None and len(df) > 100:
                 return df
         except Exception as e:
@@ -416,7 +460,7 @@ def massive_4h_optimization(df_data_4h):
 
 def main():
     print("="*70)
-    print("🚀 BACKTEST 4H (2020-2024) - COINGECKO API 🚀")
+    print("🚀 BACKTEST 4H (2020-2024) - BINANCE API 🚀")
     print("="*70)
     
     bt_temp = BTCBacktest(timeframe='4h', ma_period=8, initial_capital=10000)
