@@ -4,19 +4,18 @@ import requests
 import time
 from datetime import datetime
 
-class SMA200Backtest:
+class SMA200BreakoutBacktest:
     def __init__(self, timeframe='4h'):
         self.timeframe = timeframe
         self.initial_capital = 10000
         self.capital = 10000
         self.trades = []
-        self.equity_curve = []
+        self.daily_equity = []
         
     def download_data(self):
         print(f"[{self.timeframe}] Baixando dados da Binance (API Pública)...")
         base_url = "https://data-api.binance.vision/api/v3/klines"
         limit = 1000
-        # Desde 2018 para ter bastante histórico
         start_time = int(datetime(2018, 1, 1).timestamp() * 1000)
         end_time = int(datetime.now().timestamp() * 1000)
         
@@ -44,6 +43,9 @@ class SMA200Backtest:
         df.set_index('timestamp', inplace=True)
         for col in ['open', 'high', 'low', 'close']: df[col] = df[col].astype(float)
         
+        # Filtra dados futuros se houver
+        df = df[df.index <= pd.Timestamp.now()]
+        
         return df[['open', 'high', 'low', 'close']]
 
     def run(self, df):
@@ -53,34 +55,88 @@ class SMA200Backtest:
         self.trades = []
         self.position = None
         self.capital = self.initial_capital
+        self.daily_equity = []
         
+        buy_trigger = None
+        sell_trigger = None
+        
+        # Converter para numpy
+        opens = df['open'].values
+        highs = df['high'].values
+        lows = df['low'].values
         closes = df['close'].values
         smas = df['SMA200'].values
         dates = df.index
         
-        # Começa após 200 candles
+        # Início após 200 candles
         for i in range(200, len(df)):
             idx = dates[i]
-            curr_close = closes[i]
-            curr_sma = smas[i]
+            curr_open = opens[i].item()
+            curr_high = highs[i].item()
+            curr_low = lows[i].item()
+            curr_close = closes[i].item()
+            curr_sma = smas[i].item()
             
-            # --- Lógica de Posição ---
+            # Dados anteriores (para ver abertura em relação à média)
+            # A regra diz: "Se um candle abre acima da média..."
+            # Então olhamos o candle atual. Se ele abriu acima, armamos gatilho para romper sua máxima?
+            # Ou olhamos o candle anterior? 
+            # Interpretação Padrão de Setup de Gatilho:
+            # 1. Candle [i-1] abre acima da média.
+            # 2. Gatilho de compra = High[i-1].
+            # 3. Candle [i] rompe esse gatilho -> Entra.
             
-            # Se já estamos comprados
+            prev_open = opens[i-1].item()
+            prev_high = highs[i-1].item()
+            prev_low = lows[i-1].item()
+            prev_sma = smas[i-1].item()
+            
+            # --- SAÍDA ---
             if self.position is not None:
-                # Sinal de Saída: Fechou ABAIXO da média
-                if curr_close < curr_sma:
-                    self._close_trade(idx, curr_close, 'Close < SMA200')
+                # 1. Gatilho de Saída (Breakout)
+                if sell_trigger is not None:
+                    # Se preço perdeu a mínima do gatilho
+                    if curr_low <= sell_trigger:
+                        exit_price = min(curr_open, sell_trigger)
+                        self._close_trade(idx, exit_price, 'Breakout Exit')
+                        # Reseta triggers
+                        sell_trigger = None
+                        buy_trigger = None
+                        continue
+                        
+                    # Se abriu ACIMA da média de novo, cancela gatilho de venda?
+                    # Regra: "sair quando abre abaixo e romper"
+                    # Se este candle abriu acima, ele invalida a condição de "estar abaixo para armar venda".
+                    # Mas se já tinha armado no anterior... geralmente setups de rompimento valem por 1 candle.
+                    # Vamos assumir validade de 1 candle.
+                    sell_trigger = None 
+
+                # 2. Armar Novo Gatilho de Saída
+                # Condição: Candle anterior abriu ABAIXO da média
+                if prev_open < prev_sma:
+                    sell_trigger = prev_low
             
-            # Se estamos fora
+            # --- ENTRADA ---
             else:
-                # Sinal de Entrada: Fechou ACIMA da média
-                if curr_close > curr_sma:
-                    self._open_trade(idx, curr_close)
+                # 1. Gatilho de Entrada (Breakout)
+                if buy_trigger is not None:
+                    if curr_high > buy_trigger:
+                        entry_price = max(curr_open, buy_trigger)
+                        self._open_trade(idx, entry_price)
+                        buy_trigger = None
+                        continue
+                    
+                    # Validade de 1 candle
+                    buy_trigger = None
+                
+                # 2. Armar Novo Gatilho de Entrada
+                # Condição: Candle anterior abriu ACIMA da média
+                if prev_open > prev_sma:
+                    buy_trigger = prev_high
             
-            # Equity Curve (Valor de mercado no fechamento)
+            # Equity Curve
             val = (self.position['qty'] * curr_close) if self.position else self.capital
-            self.equity_curve.append({'Date': idx, 'Equity': val})
+            self.daily_equity.append({'Date': idx, 'Equity': val})
 
     def _open_trade(self, date, price):
         qty = self.capital / price
@@ -90,10 +146,12 @@ class SMA200Backtest:
         val = price * self.position['qty']
         pnl = val - self.capital
         pnl_pct = (price / self.position['entry_price']) - 1
-        duration = (date - self.position['entry_date']).total_seconds() / 3600 # Horas
+        duration = (date - self.position['entry_date']).total_seconds() / 3600
         
         self.capital = val
         self.trades.append({
+            'entry_date': self.position['entry_date'],
+            'exit_date': date,
             'pnl': pnl,
             'pnl_pct': pnl_pct,
             'duration': duration
@@ -110,53 +168,82 @@ class SMA200Backtest:
         total_return = ((self.capital - self.initial_capital) / self.initial_capital) * 100
         pf = wins['pnl'].sum() / abs(losses['pnl'].sum()) if not losses.empty else 999
         
-        # Calcular Drawdown
-        df_eq = pd.DataFrame(self.equity_curve)
-        df_eq['cummax'] = df_eq['Equity'].cummax()
-        df_eq['dd'] = (df_eq['Equity'] - df_eq['cummax']) / df_eq['cummax']
-        max_dd = df_eq['dd'].min() * 100
+        # Calcular Retorno Anual
+        df_eq = pd.DataFrame(self.daily_equity)
+        df_eq.set_index('Date', inplace=True)
+        df_eq['Year'] = df_eq.index.year
+        yearly_equity = df_eq.groupby('Year')['Equity'].last()
         
-        # Buy & Hold para comparação
-        start_price = self.equity_curve[0]['Equity'] if self.equity_curve else 10000 # Preço inicial do BTC no periodo
-        # Ajuste para comparar retorno do ativo, não da equity inicial que é caixa
-        # Mas aqui comparamos o retorno da estratégia
+        # Ajuste base
+        start_val = self.initial_capital
+        yearly_returns = {}
+        
+        prev = start_val
+        # Garante que 2018 (ano inicial) seja calculado corretamente desde o capital inicial
+        # Se o primeiro dado for do meio de 2018, ok.
+        
+        for y in range(2018, 2026):
+            if y in yearly_equity.index:
+                curr = yearly_equity.loc[y]
+                # Se for o primeiro ano, compara com capital inicial, senão com ano anterior
+                base = yearly_equity.loc[y-1] if (y-1) in yearly_equity.index else start_val
+                
+                ret = ((curr - base) / base) * 100
+                yearly_returns[y] = ret
+            else:
+                yearly_returns[y] = 0.0
         
         return {
             'Timeframe': self.timeframe,
             'Trades': len(df_t),
             'Win Rate': (len(wins) / len(df_t)) * 100,
-            'Avg Duration': df_t['duration'].mean(),
             'Return %': total_return,
             'Profit Factor': pf,
-            'Max Drawdown': max_dd
+            'Yearly': yearly_returns
         }
 
 def main():
     print("="*100)
-    print("🚀 BTC TREND FOLLOWING (SMA 200) - 4H vs 1H 🚀")
+    print("🚀 BTC SMA200 BREAKOUT (4H vs 1H) - ANÁLISE ANUAL 🚀")
     print("="*100)
-    print("Regra: Compra Close > SMA200 | Vende Close < SMA200")
+    print("Lógica: Compra se abre > SMA200 e rompe máxima.")
+    print("        Vende se abre < SMA200 e rompe mínima.")
     print("-" * 100)
     
     results = []
     
     for tf in ['4h', '1h']:
-        bt = SMA200Backtest(timeframe=tf)
+        bt = SMA200BreakoutBacktest(timeframe=tf)
         df = bt.download_data()
         
         if df is not None:
-            print(f"  Dados: {len(df)} candles ({df.index[0]} -> {df.index[-1]})")
+            print(f"  [{tf.upper()}] Dados: {len(df)} candles ({df.index[0]} -> {df.index[-1]})")
             bt.run(df)
             res = bt.get_results()
             if res: results.append(res)
             
     print("\n" + "="*100)
-    print(f"{'TF':<6} | {'TRADES':<8} | {'WIN RATE':<10} | {'RETORNO':<12} | {'P. FACTOR':<10} | {'MAX DD':<10} | {'DURAÇÃO (h)':<12}")
+    print(f"{'METRICA':<15} | {'4H (Breakout)':<15} | {'1H (Breakout)':<15}")
     print("-" * 100)
     
-    for r in results:
-        print(f"{r['Timeframe']:<6} | {r['Trades']:<8} | {r['Win Rate']:>8.2f}% | {r['Return %']:>10.2f}% | {r['Profit Factor']:>8.2f} | {r['Max Drawdown']:>8.2f}% | {r['Avg Duration']:>10.1f}")
+    if len(results) == 2:
+        r4h = results[0]
+        r1h = results[1]
         
+        print(f"{'Total Trades':<15} | {r4h['Trades']:<15} | {r1h['Trades']:<15}")
+        print(f"{'Win Rate':<15} | {r4h['Win Rate']:>14.2f}% | {r1h['Win Rate']:>14.2f}%")
+        print(f"{'Profit Factor':<15} | {r4h['Profit Factor']:>15.2f} | {r1h['Profit Factor']:>15.2f}")
+        print(f"{'Retorno Total':<15} | {r4h['Return %']:>14.2f}% | {r1h['Return %']:>14.2f}%")
+        
+        print("-" * 100)
+        print("RETORNO ANUAL:")
+        print("-" * 100)
+        
+        for y in range(2018, 2026):
+            ret4h = r4h['Yearly'].get(y, 0)
+            ret1h = r1h['Yearly'].get(y, 0)
+            print(f"{y:<15} | {ret4h:>14.2f}% | {ret1h:>14.2f}%")
+            
     print("="*100)
 
 if __name__ == "__main__":
