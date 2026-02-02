@@ -29,6 +29,7 @@ class MA8Backtest:
         return df[['Open', 'High', 'Low', 'Close']]
 
     def prepare_indicators(self, df):
+        df = df.copy() # Evita SettingWithCopyWarning
         df['MA8'] = df['Close'].rolling(window=8).mean()
         
         # Detectar viradas
@@ -58,37 +59,43 @@ class MA8Backtest:
         stop_loss = None     # Stop Loss inicial
         sell_trigger = None  # Para modo 'breakout'
         
+        # Converter para listas/arrays para performance e evitar erros de Series
+        # Isso garante que estamos lidando com valores escalares simples
+        opens = df['Open'].values
+        highs = df['High'].values
+        lows = df['Low'].values
+        closes = df['Close'].values
+        dates = df.index
+        turn_up = df['Turn_Up'].values
+        turn_down = df['Turn_Down'].values
+        
         # Iterar linha a linha
         for i in range(10, len(df)):
-            idx = df.index[i]
-            prev_idx = df.index[i-1]
+            idx = dates[i]
             
-            curr_open = df['Open'].iloc[i]
-            curr_high = df['High'].iloc[i]
-            curr_low = df['Low'].iloc[i]
-            curr_close = df['Close'].iloc[i]
+            curr_open = float(opens[i])
+            curr_high = float(highs[i])
+            curr_low = float(lows[i])
             
             # Dados do candle ANTERIOR (onde o sinal acontece)
-            prev_turn_up = df['Turn_Up'].iloc[i-1]
-            prev_turn_down = df['Turn_Down'].iloc[i-1]
-            prev_high = df['High'].iloc[i-1]
-            prev_low = df['Low'].iloc[i-1]
+            prev_turn_up = bool(turn_up[i-1])
+            prev_turn_down = bool(turn_down[i-1])
+            prev_high = float(highs[i-1])
+            prev_low = float(lows[i-1])
             
             # ----------------------------------------
             # GESTÃO DE POSIÇÃO (SAÍDA)
             # ----------------------------------------
-            if self.position:
+            if self.position is not None:
                 # 1. Verificar STOP LOSS (Prioridade máxima)
-                # O Stop Loss foi definido na entrada (mínima do candle de sinal)
                 if curr_low <= self.position['stop_price']:
-                    # Assume slippage zero, sai no stop exato (ou abertura se abriu abaixo)
                     exit_price = min(curr_open, self.position['stop_price'])
                     self._close_trade(idx, exit_price, 'Stop Loss')
-                    buy_trigger = None # Cancela qualquer reentrada imediata no mesmo candle
+                    buy_trigger = None 
                     continue
 
                 # 2. Verificar GATILHO DE SAÍDA (Modo Breakout)
-                if self.exit_mode == 'breakout' and sell_trigger:
+                if self.exit_mode == 'breakout' and sell_trigger is not None:
                     # Desarma se MA virou pra cima de novo
                     if prev_turn_up:
                         sell_trigger = None
@@ -101,16 +108,10 @@ class MA8Backtest:
                 # 3. Lógica de Sinal de Saída
                 if prev_turn_down:
                     if self.exit_mode == 'simple':
-                        # Sai no fechamento do candle atual que confirmou a virada para baixo no anterior? 
-                        # NÃO. Se virou no anterior (prev_turn_down), a gente já sabe na abertura deste.
-                        # Setup clássico Larry Williams/MA: Virou pra baixo, sai no FECHAMENTO ou ABERTURA?
-                        # Pedido: "média simplesmente virar para baixo". Normalmente isso executa no Close do candle que virou 
-                        # ou Open do seguinte. Vou usar Open do seguinte para ser realista (backtest não pode olhar futuro).
-                        
                         self._close_trade(idx, curr_open, 'MA Turn Down')
                         
                     elif self.exit_mode == 'breakout':
-                        # Arma gatilho na mínima do candle que virou (prev_low)
+                        # Arma gatilho na mínima do candle que virou
                         sell_trigger = prev_low
 
             # ----------------------------------------
@@ -118,22 +119,20 @@ class MA8Backtest:
             # ----------------------------------------
             else: # Não posicionado
                 
-                # Se tínhamos um gatilho de compra armado do candle anterior
-                if buy_trigger:
+                # Se tínhamos um gatilho de compra armado
+                if buy_trigger is not None:
                     # Verifica rompimento
                     if curr_high > buy_trigger:
-                        # Compra
                         entry_price = max(curr_open, buy_trigger)
+                        # O stop loss é definido quando o gatilho é criado (prev_low do candle de sinal)
                         self._open_trade(idx, entry_price, stop_loss)
-                        buy_trigger = None # Consumiu o gatilho
+                        buy_trigger = None 
                     else:
-                        # Se não rompeu, verifica se o setup ainda é válido.
-                        # Normalmente setups de gatilho valem apenas para o candle seguinte.
-                        # Se não acionou, cancela.
+                        # Setup cancelado se não acionou no candle seguinte
                         buy_trigger = None
                         stop_loss = None
 
-                # Verifica se gerou NOVO sinal de entrada (para o próximo candle)
+                # Verifica se gerou NOVO sinal de entrada
                 if prev_turn_up:
                     buy_trigger = prev_high
                     stop_loss = prev_low
@@ -216,9 +215,13 @@ def main():
     ]
     
     for label, key, fmt in metrics:
-        val1 = res_simple[key]
-        val2 = res_breakout[key]
-        print(f"{label:<25} | {fmt.format(val1):<20} | {fmt.format(val2):<20}")
+        if res_simple and res_breakout:
+            val1 = res_simple[key]
+            val2 = res_breakout[key]
+            print(f"{label:<25} | {fmt.format(val1):<20} | {fmt.format(val2):<20}")
+        else:
+            print("Sem trades suficientes para calcular métricas.")
+            break
     
     print("="*80)
     print("\nLEGENDA:")
