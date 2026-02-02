@@ -34,12 +34,10 @@ class MA8TargetTest:
         
         buy_trigger = None
         stop_loss = None
-        take_profit = None
         
         opens = df['Open'].values
         highs = df['High'].values
         lows = df['Low'].values
-        closes = df['Close'].values # Não usado na lógica fixa, mas mantido
         turn_up = df['Turn_Up'].values
         dates = df.index
         
@@ -121,7 +119,7 @@ def main():
     targets = [4.0, 4.25, 4.5, 4.75, 5.0, 5.25, 5.5]
     
     print("="*100)
-    print("🚀 OTIMIZAÇÃO DE ALVO CORINGA (W1) - MA8 🚀")
+    print("🚀 OTIMIZAÇÃO DE ALVO CORINGA (W1) - COM E SEM BTC 🚀")
     print("="*100)
     
     results = {}
@@ -129,7 +127,6 @@ def main():
     for ticker, name in assets:
         print(f"Processando {name}...", end='\r')
         
-        # Download único
         dummy = MA8TargetTest(ticker, name, 0)
         df = dummy.download_data()
         
@@ -145,13 +142,15 @@ def main():
     
     print(" " * 50)
     
-    # Criar DataFrame
     df_final = pd.DataFrame(results).T
     
-    # Adicionar linha de SOMA TOTAL (O fator decisivo)
-    df_final.loc['SOMA TOTAL DO PORTFÓLIO'] = df_final.sum()
+    # 1. Total COM Bitcoin
+    df_final.loc['SOMA (COM BTC)'] = df_final.sum()
     
-    # Formatação
+    # 2. Total SEM Bitcoin
+    df_no_btc = df_final.drop(['Bitcoin', 'SOMA (COM BTC)'])
+    df_final.loc['SOMA (SEM BTC)'] = df_no_btc.sum()
+    
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', 1000)
     pd.set_option('display.float_format', '{:,.2f}%'.format)
@@ -160,14 +159,19 @@ def main():
     print("-" * 100)
     print(df_final)
     
-    # Encontrar o vencedor
-    totals = df_final.loc['SOMA TOTAL DO PORTFÓLIO']
-    winner_target = totals.idxmax()
-    winner_val = totals.max()
+    # Análise dos Vencedores
+    total_btc = df_final.loc['SOMA (COM BTC)']
+    total_no_btc = df_final.loc['SOMA (SEM BTC)']
+    
+    win_btc = total_btc.idxmax()
+    val_btc = total_btc.max()
+    
+    win_no_btc = total_no_btc.idxmax()
+    val_no_btc = total_no_btc.max()
     
     print("\n" + "="*100)
-    print(f"🏆 O ALVO CORINGA É: {winner_target}")
-    print(f"💰 Retorno Total Acumulado (Todos ativos): {winner_val:,.2f}%")
+    print(f"🏆 VENCEDOR GERAL (COM BITCOIN): {win_btc} ({val_btc:,.2f}%)")
+    print(f"🛡️  VENCEDOR CONSERVADOR (SEM BITCOIN): {win_no_btc} ({val_no_btc:,.2f}%)")
     print("="*100)
 
 if __name__ == "__main__":
